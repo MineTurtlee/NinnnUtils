@@ -9,3 +9,5 @@ this bot adds:
 - An economy and Leveling system
 - Minigames (Economy minigames, Counter)
 - Welcome and goodbye messages with banners
+
+Support Server https://discord.gg/FSBPvc9zqY
