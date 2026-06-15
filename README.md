@@ -10,4 +10,5 @@ this bot adds:
 - Minigames (Economy minigames, Counter)
 - Welcome and goodbye messages with banners
 
+Install Link https://discord.com/oauth2/authorize?client_id=1500798502735708281
 Support Server https://discord.gg/FSBPvc9zqY
