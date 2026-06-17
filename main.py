@@ -85,6 +85,7 @@ edited_cache = []
 active_minigame_users = set()
 server_pauses = {}
 all_paused_guilds = set()
+reaction_xp_cooldowns = {}
 
 # --- Data Helpers ---
 
@@ -621,7 +622,7 @@ class DeletedMediaView(discord.ui.View):
         self.revealed = not self.revealed
         await self.handle_page_update(interaction)
 
-    @discord.ui.button(label="Previous", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Previous media", style=discord.ButtonStyle.primary)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.requester:
             await interaction.response.send_message("❌ Only the person who ran the command can flip pages!", ephemeral=True)
@@ -630,7 +631,7 @@ class DeletedMediaView(discord.ui.View):
             self.index -= 1
             await self.handle_page_update(interaction)
 
-    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Next media", style=discord.ButtonStyle.primary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.requester:
             await interaction.response.send_message("❌ Only the person who ran the command can flip pages!", ephemeral=True)
@@ -674,7 +675,7 @@ async def on_ready():
         if bot.shards
         else "single process (no sharding)"
     )
-    print(f"Logged in as {bot.user} (ID: {bot.user.id}) — {shard_info}")
+    print(f"Logged in as {bot.user} (ID: {bot.user.id}) - {shard_info}")
     print(f"Serving {len(bot.guilds)} guild(s)")
     if not update_presence.is_running():
         update_presence.start()
@@ -855,7 +856,12 @@ async def on_raw_reaction_add(payload):
 
     reactor = guild.get_member(payload.user_id)
     if reactor and not reactor.bot:
-        await add_xp(reactor, guild, random.randint(3, 5))
+        cooldown_key = (payload.guild_id, payload.user_id)
+        now = datetime.now()
+        last_xp = reaction_xp_cooldowns.get(cooldown_key)
+        if not last_xp or (now - last_xp).total_seconds() >= 15:
+            reaction_xp_cooldowns[cooldown_key] = now
+            await add_xp(reactor, guild, random.randint(1, 3))
         try:
             channel = guild.get_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
@@ -1280,14 +1286,14 @@ async def voice_leave(interaction: discord.Interaction):
         await interaction.response.send_message("❌ I'm not connected to a voice channel!", ephemeral=True)
 
 
-@bot.tree.command(name="counter-set", description="Enable counting in a channel and optionally reset on fail")
+@bot.tree.command(name="counter-channel-set", description="Enable counting in a channel and optionally reset on fail")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     channel="The text channel where counting will happen",
     reset_when_fail="If enabled, the current counter resets when someone fails"
 )
-async def counter_set(interaction: discord.Interaction, channel: discord.TextChannel, reset_when_fail: bool = False):
+async def counter_channel_set(interaction: discord.Interaction, channel: discord.TextChannel, reset_when_fail: bool = False):
     set_counter_channel(str(interaction.guild.id), channel.id, reset_when_fail)
     status_text = "resets on fail" if reset_when_fail else "does not reset on fail"
     await interaction.response.send_message(f"✅ Counter enabled in {channel.mention} and {status_text}.", ephemeral=False)
@@ -1307,14 +1313,14 @@ async def counter_del(interaction: discord.Interaction, channel: discord.TextCha
         await interaction.response.send_message(f"⚠️ That channel does not have an active counter.", ephemeral=True)
 
 
-@bot.tree.command(name="adm-counter-set", description="Set the current count in a counter channel")
+@bot.tree.command(name="counter-number-set", description="Set the current count in a counter channel")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     channel="The counter channel to update",
     value="The new current count value"
 )
-async def adm_counter_set(interaction: discord.Interaction, channel: discord.TextChannel, value: int):
+async def counter_number_set(interaction: discord.Interaction, channel: discord.TextChannel, value: int):
     success = set_counter_value(str(interaction.guild.id), channel.id, value)
     if success:
         await interaction.response.send_message(f"✅ Counter in {channel.mention} is now set to {value}.", ephemeral=False)
@@ -1394,11 +1400,11 @@ async def auto_reply(interaction: discord.Interaction, word: str, reply1: str, r
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="reply-clear", description="Remove a trigger word from this server's fun system")
+@bot.tree.command(name="auto-reply-clear", description="Remove a trigger word from this server's fun system")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(word="The trigger word you want to delete")
-async def reply_clear(interaction: discord.Interaction, word: str):
+async def auto_reply_clear(interaction: discord.Interaction, word: str):
     guild_id = str(interaction.guild.id)
     trigger_word = word.lower()
     fun_data = load_fun_data()
@@ -1416,14 +1422,62 @@ async def reply_clear(interaction: discord.Interaction, word: str):
     else:
         await interaction.response.send_message(f"❌ '{word}' isn't registered as a fun reply trigger in this server.", ephemeral=True)
 
-@bot.tree.command(name="own-shutdown", description="(owner) Stop the bot for an update or just to take a break")
-async def own_shutdown(interaction: discord.Interaction):
+@bot.tree.command(name="own-shutdown", description="(owner) Stop the bot for an update or just to restart")
+@app_commands.describe(
+    channel="Optional announcement channel to send the shutdown message to",
+    reason="The shutdown reason to publish"
+)
+async def own_shutdown(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel = None,
+    reason: str = "No reason provided"
+):
     if not await bot.is_owner(interaction.user):
         return await interaction.response.send_message("❌ Do not even try...", ephemeral=True)
+
+    target_channel = channel or bot.get_channel(1514173159052415026)
+    if target_channel is None and isinstance(interaction.channel, discord.TextChannel):
+        target_channel = interaction.channel
+
+    shutdown_text = (
+        f"🔌 {reason}"
+    )
+    shutdown_embed = discord.Embed(
+        title="Bot Shutdown Initiated",
+        description=shutdown_text,
+        color=discord.Color.light_gray()
+    )
+
+    published = False
+    if target_channel is not None:
+        try:
+            sent_msg = await target_channel.send(embed=shutdown_embed)
+            if target_channel.type == discord.ChannelType.news:
+                try:
+                    await sent_msg.publish()
+                    published = True
+                except Exception:
+                    published = False
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Could not send the shutdown notice to {target_channel.mention}. Error: {e}",
+                ephemeral=True
+            )
+            return
+
     if update_presence.is_running():
         update_presence.cancel()
         await asyncio.sleep(1)
-    await interaction.response.send_message("Going to sleep...")
+
+    response_text = "Going to sleep..."
+    if target_channel is not None:
+        response_text = (
+            f"Shutdown notice sent to {target_channel.mention}. "
+            + ("Published to followers." if published else "")
+        )
+
+    await interaction.response.send_message(response_text)
+
     shutdown_activity = discord.Activity(type=discord.ActivityType.watching, name="App is shutting down!!! !! !")
     sleep_activity = discord.Activity(type=discord.ActivityType.watching, name="App is sleeping... zZzZzZ")
     for shard_id in bot.shards:
@@ -1435,9 +1489,33 @@ async def own_shutdown(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="own-stop-urgent", description="(owner) STOPS IMMEDIATLY IF SOMETHING WENT REALLY WRONG")
-async def own_stop_urgent(interaction: discord.Interaction):
+@app_commands.describe(channel="Optional announcement channel to send the force shutdown message to")
+async def own_stop_urgent(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not await bot.is_owner(interaction.user):
         return await interaction.response.send_message("❌ Stop.", ephemeral=True)
+
+    target_channel = channel or bot.get_channel(1514173159052415026)
+    if target_channel is None and isinstance(interaction.channel, discord.TextChannel):
+        target_channel = interaction.channel
+
+    force_text = "⚠️ The bot is going offline immediately due to an urgent issue."
+    force_embed = discord.Embed(
+        title="Force Shutdown",
+        description=force_text,
+        color=discord.Color.red()
+    )
+
+    if target_channel is not None:
+        try:
+            sent_msg = await target_channel.send(embed=force_embed)
+            if target_channel.type == discord.ChannelType.news:
+                try:
+                    await sent_msg.publish()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     if update_presence.is_running():
         update_presence.cancel()
     await interaction.response.send_message("Goodbye.")
@@ -1588,7 +1666,7 @@ async def timeout(interaction: discord.Interaction, member: discord.Member, days
         await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
 
 
-@bot.tree.command(name="adm-ghost-toggle", description="Enable or disable ghost ping notifications in this guild")
+@bot.tree.command(name="toggle-ghost-pings", description="Enable or disable ghost ping notifications in this guild")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 async def ghost_toggle(interaction: discord.Interaction):
@@ -1612,7 +1690,7 @@ async def ghost_toggle(interaction: discord.Interaction):
     print(f"👻 Ghost ping notifications {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
 
 
-@bot.tree.command(name="adm-history-toggle", description="Enable or disable /edited and /deleted history in this guild")
+@bot.tree.command(name="toggle-history", description="Enable or disable /edited and /deleted history in this guild")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 async def history_toggle(interaction: discord.Interaction):
@@ -1634,7 +1712,7 @@ async def history_toggle(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=False)
     print(f"🗄️ Edit/Delete history {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
 
-@bot.tree.command(name="ver", description="Display the bot's version")
+@bot.tree.command(name="version", description="Display the bot's version")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def ver(interaction: discord.Interaction):
@@ -1995,6 +2073,7 @@ async def ping(interaction: discord.Interaction):
 async def stats(interaction: discord.Interaction):
     load_dotenv(override=True)
     VERSION = os.getenv('BOT_VERSION')
+    ACTIVITY_TEXT = os.getenv('ACTIVITY')
     total_members = sum(guild.member_count for guild in bot.guilds)
     total_guilds = len(bot.guilds)
     embed = discord.Embed(
@@ -2016,7 +2095,7 @@ async def stats(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
-@bot.tree.command(name="slot-old", description="Spin the slot machine!")
+@bot.tree.command(name="slot-classic", description="Spin the slot machine!")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slot(interaction: discord.Interaction):
@@ -2033,7 +2112,7 @@ async def slot(interaction: discord.Interaction):
         result_msg = f"🎰 Slot Machine:\n\n| {final_e1} | {final_e2} | {final_e3} |\n\nBetter luck next time!"
     await interaction.edit_original_response(content=result_msg)
 
-@bot.tree.command(name="coinflip", description="Flips a coin and shows Heads or Tails")
+@bot.tree.command(name="coinflip-classic", description="Flips a coin and shows Heads or Tails")
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def coinflip(interaction: discord.Interaction):
@@ -2111,16 +2190,17 @@ async def eco_leaderboard(interaction: discord.Interaction, limit: int = 10):
             member = await interaction.guild.fetch_member(int(uid))
             name = member.display_name
         except Exception:
-            name = f"<Unknown user {uid}>"
-        description_lines.append(f"{idx}. **{name}**: ${bal}")
+            name = f"User left server (`{uid}`)"
+        description_lines.append(f"`#{idx}` **{name}** - ${bal}")
 
-    embed = discord.Embed(title=f"🏆 Economy Leaderboard - Top {len(top)}", description="\n".join(description_lines), color=discord.Color.gold())
+    embed = discord.Embed(title=f"🏆 Economy Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
+    embed.description = "\n".join(description_lines)
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="balance", description="Check your balance (or another user's if owner)")
+@bot.tree.command(name="eco-balance", description="Check your balance (or another user's if owner)")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.describe(user="The user you want to check (Owner only)")
-async def balance(interaction: discord.Interaction, user: discord.Member = None):
+async def eco_balance(interaction: discord.Interaction, user: discord.Member = None):
     if user and interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("❌ Only the server owner can check other users' balances!", ephemeral=True)
     target = user or interaction.user
@@ -2129,10 +2209,10 @@ async def balance(interaction: discord.Interaction, user: discord.Member = None)
     await interaction.response.send_message(f"💰 {target.display_name}'s balance: **${money}**")
 
 
-@bot.tree.command(name="daily", description="Claim your daily reward")
+@bot.tree.command(name="eco-daily", description="Claim your daily reward")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.checks.cooldown(1, 86400, key=lambda i: (i.user.id, i.guild.id))
-async def daily(interaction: discord.Interaction):
+async def eco_daily(interaction: discord.Interaction):
     data = load_data()
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
     earnings = random.randint(150, 200)
@@ -2141,9 +2221,9 @@ async def daily(interaction: discord.Interaction):
     await interaction.response.send_message(f"💵 You claimed your daily reward and earned **${earnings}**!")
 
 
-@bot.tree.command(name="pay", description="Pay another user from your balance")
+@bot.tree.command(name="eco-pay", description="Pay another user from your balance")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def pay(interaction: discord.Interaction, user: discord.Member, amount: int):
+async def eco_pay(interaction: discord.Interaction, user: discord.Member, amount: int):
     if amount <= 0:
         return await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
     data = load_data()
@@ -2158,9 +2238,9 @@ async def pay(interaction: discord.Interaction, user: discord.Member, amount: in
     await interaction.response.send_message(f"✅ Successfully sent **${amount}** to {user.mention}!")
 
 
-@bot.tree.command(name="shop", description="View the server shop")
+@bot.tree.command(name="eco-shop", description="View the server shop")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def shop(interaction: discord.Interaction):
+async def eco_shop(interaction: discord.Interaction):
     data = load_data()
     shop_items = data.get(str(interaction.guild.id), {}).get("shop", {})
     if not shop_items:
@@ -2176,7 +2256,7 @@ async def shop(interaction: discord.Interaction):
 @bot.tree.command(name="eco-shop-add", description="Add an item to the shop")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def shop_add(interaction: discord.Interaction, name: str, desc: str, price: int):
+async def eco_shop_add(interaction: discord.Interaction, name: str, desc: str, price: int):
     name = normalize_item(name)
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
@@ -2188,7 +2268,7 @@ async def shop_add(interaction: discord.Interaction, name: str, desc: str, price
 @bot.tree.command(name="eco-shop-del", description="Remove an item from the shop")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def shop_del(interaction: discord.Interaction, name: str):
+async def eco_shop_del(interaction: discord.Interaction, name: str):
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
     canonical = find_item_key(guild["shop"], name)
@@ -2200,10 +2280,10 @@ async def shop_del(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(f"❌ **{name}** was not found in the shop.", ephemeral=True)
 
 
-@bot.tree.command(name="inventory", description="Check your inventory (or another user's if owner)")
+@bot.tree.command(name="eco-inventory", description="Check your inventory (or another user's if owner)")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.describe(user="The user you want to check (Owner only)")
-async def inventory(interaction: discord.Interaction, user: discord.Member = None):
+async def eco_inventory(interaction: discord.Interaction, user: discord.Member = None):
     if user and interaction.user.id != interaction.guild.owner_id:
         return await interaction.response.send_message("❌ Only the server owner can check others' inventories.", ephemeral=True)
     target = user or interaction.user
@@ -2235,7 +2315,7 @@ async def eco_inventory_edit(interaction: discord.Interaction, user: discord.Mem
         if removed < amount:
             save_data(data)
             return await interaction.response.send_message(
-                f"⚠️ Only removed **{removed}x {item}** — {user.display_name} didn't have enough.", ephemeral=True
+                f"⚠️ Only removed **{removed}x {item}** - {user.display_name} didn't have enough.", ephemeral=True
             )
     save_data(data)
     direction = "to" if action == "add" else "from"
@@ -2346,7 +2426,7 @@ class MinesButton(discord.ui.Button):
             data = load_data()
             user_data = get_user_data(data, view.guild_id, view.user_id)
             after_balance = user_data["balance"]
-            view.embed.title = "💥 Minesweeper — Lost"
+            view.embed.title = "💥 Minesweeper - Lost"
             view.embed.description = (
                 f"You hit a mine and lost your wager of **${view.amount}**.\n"
                 f"Safe tiles found: **{len(view.revealed_positions)}/{view.total_safe}**"
@@ -2388,14 +2468,13 @@ class MinesCashoutButton(discord.ui.Button):
         active_minigame_users.discard(view.user_id)
         view.finished = True
         view.disable_all_items()
-        view.embed.title = "💰 Minesweeper — Cash Out"
+        view.embed.title = "💰 Minesweeper - Cash Out"
         view.embed.description = (
             f"You cashed out with **${payout}**.\n"
             f"Safe tiles found: **{len(view.revealed_positions)}/{view.total_safe}**"
         )
         view.embed.set_footer(text=f"Before: ${view.before_balance} • After: ${user_data['balance']}")
         await interaction.response.edit_message(embed=view.embed, view=view)
-
 
 class MinesGameView(discord.ui.View):
     def __init__(self, amount: int, mines: int, guild_id: str, user_id: int, before_balance: int):
@@ -2502,7 +2581,7 @@ class MinesGameView(discord.ui.View):
         active_minigame_users.discard(self.user_id)
         self.finished = True
         self.disable_all_items()
-        self.embed.title = "🏁 Minesweeper — Victory"
+        self.embed.title = "🏁 Minesweeper - Victory"
         self.embed.description = (
             f"You safely revealed all non-mine tiles and won **${payout}**!\n"
             f"Safe tiles found: **{len(self.revealed_positions)}/{self.total_safe}**"
@@ -2524,7 +2603,7 @@ class MinesGameView(discord.ui.View):
         self.disable_all_items()
         self.reveal_board()
         if self.message:
-            self.embed.title = "⌛ Minesweeper — Timed Out"
+            self.embed.title = "⌛ Minesweeper - Timed Out"
             self.embed.description = (
                 f"Time expired and your wager of **${self.amount}** was lost.\n"
                 f"Safe tiles found: **{len(self.revealed_positions)}/{self.total_safe}**"
@@ -2599,7 +2678,7 @@ class TowerButton(discord.ui.Button):
             data = load_data()
             user_data = get_user_data(data, view.guild_id, view.user_id)
             after_balance = user_data["balance"]
-            view.embed.title = "🏯 Tower Gamble — Lost"
+            view.embed.title = "🏯 Tower Gamble - Lost"
             view.embed.description = (
                 f"You chose the wrong button and lost your wager of **${view.amount}**.\n"
                 f"Rows cleared: {view.rows_cleared()}/5"
@@ -2629,7 +2708,7 @@ class CashoutButton(discord.ui.Button):
         active_minigame_users.discard(view.user_id)
         view.finished = True
         view.disable_all_items()
-        view.embed.title = "💰 Tower Gamble — Cash Out"
+        view.embed.title = "💰 Tower Gamble - Cash Out"
         view.embed.description = (
             f"You cashed out with **${payout}**.\n"
             f"Rows cleared: {view.rows_cleared()}/5"
@@ -2713,7 +2792,7 @@ class TowersGameView(discord.ui.View):
         active_minigame_users.discard(self.user_id)
         self.finished = True
         self.disable_all_items()
-        self.embed.title = "🏁 Tower Gamble — Victory"
+        self.embed.title = "🏁 Tower Gamble - Victory"
         self.embed.description = (
             f"You reached the top and won **${payout}**!\n"
             f"Rows cleared: **5/5**"
@@ -2737,7 +2816,7 @@ class TowersGameView(discord.ui.View):
             data = load_data()
             user_data = get_user_data(data, self.guild_id, self.user_id)
             after_balance = user_data["balance"]
-            self.embed.title = "⌛ Tower Gamble — Timed Out"
+            self.embed.title = "⌛ Tower Gamble - Timed Out"
             self.embed.description = (
                 f"Time expired and your wager of **${self.amount}** was lost.\n"
                 f"Rows cleared: **{self.rows_cleared()}/5**"
@@ -2798,13 +2877,13 @@ class DeveloperCodeSelect(discord.ui.Select):
             user_data = get_user_data(data, view.guild_id, view.user_id)
             user_data["balance"] += payout
             save_data(data)
-            view.embed.title = "👨‍💻 Developer Job — Success!"
+            view.embed.title = "👨‍💻 Developer Job - Success!"
             view.embed.description = f"You found the odd code string and earned **${payout}**!"
             await interaction.response.edit_message(embed=view.embed, view=view)
         else:
             view.finished = True
             view.disable_all_items()
-            view.embed.title = "👨‍💻 Developer Job — Failed!"
+            view.embed.title = "👨‍💻 Developer Job - Failed!"
             view.embed.description = "That's not the odd code! You didn't earn anything this time."
             await interaction.response.edit_message(embed=view.embed, view=view)
 
@@ -2831,7 +2910,7 @@ class DeveloperCodeButton(discord.ui.Button):
             user_data = get_user_data(data, view.guild_id, view.user_id)
             user_data["balance"] += payout
             save_data(data)
-            view.embed.title = "👨‍💻 Developer Job — Success!"
+            view.embed.title = "👨‍💻 Developer Job - Success!"
             view.embed.description = f"You found the odd code string and earned **${payout}**!"
             await interaction.response.edit_message(embed=view.embed, view=view)
         else:
@@ -2839,7 +2918,7 @@ class DeveloperCodeButton(discord.ui.Button):
             self.style = discord.ButtonStyle.danger
             view.finished = True
             view.disable_all_items()
-            view.embed.title = "👨‍💻 Developer Job — Failed!"
+            view.embed.title = "👨‍💻 Developer Job - Failed!"
             view.embed.description = "That's not the odd code! You didn't earn anything this time."
             await interaction.response.edit_message(embed=view.embed, view=view)
 
@@ -2877,7 +2956,7 @@ class FarmerCropButton(discord.ui.Button):
                 user_data = get_user_data(data, view.guild_id, view.user_id)
                 user_data["balance"] += payout
                 save_data(data)
-                view.embed.title = "🌱 Farmer Job — Success!"
+                view.embed.title = "🌱 Farmer Job - Success!"
                 view.embed.description = f"You collected all the correct crops and earned **${payout}**!"
                 await interaction.response.edit_message(embed=view.embed, view=view)
             else:
@@ -2887,7 +2966,7 @@ class FarmerCropButton(discord.ui.Button):
             self.style = discord.ButtonStyle.danger
             view.finished = True
             view.disable_all_items()
-            view.embed.title = "🌱 Farmer Job — Failed!"
+            view.embed.title = "🌱 Farmer Job - Failed!"
             view.embed.description = "You clicked the wrong crop! You didn't earn anything this time."
             await interaction.response.edit_message(embed=view.embed, view=view)
 
@@ -3003,14 +3082,14 @@ class WorkGameView(discord.ui.View):
                         user_data = get_user_data(data, self.view.guild_id, self.view.user_id)
                         user_data["balance"] += payout
                         save_data(data)
-                        self.view.embed.title = "🧮 Math Teacher Job — Success!"
+                        self.view.embed.title = "🧮 Math Teacher Job - Success!"
                         self.view.embed.description = f"Correct! The answer is **{self.view.correct_answer}**. You earned **${payout}**!"
                         await modal_interaction.response.defer()
                         await self.view.message.edit(embed=self.view.embed, view=self.view)
                     else:
                         self.view.finished = True
                         self.view.disable_all_items()
-                        self.view.embed.title = "🧮 Math Teacher Job — Failed!"
+                        self.view.embed.title = "🧮 Math Teacher Job - Failed!"
                         self.view.embed.description = f"Wrong! The correct answer is **{self.view.correct_answer}**. You didn't earn anything this time."
                         await modal_interaction.response.defer()
                         await self.view.message.edit(embed=self.view.embed, view=self.view)
@@ -3045,7 +3124,7 @@ class WorkGameView(discord.ui.View):
         self.finished = True
         self.disable_all_items()
         if self.message:
-            self.embed.title = "⏰ Work — Timed Out"
+            self.embed.title = "⏰ Work - Timed Out"
             self.embed.description = "Time expired! You didn't earn anything this time."
             try:
                 await self.message.edit(embed=self.embed, view=self)
@@ -3055,7 +3134,7 @@ class WorkGameView(discord.ui.View):
 
 work_cooldowns = {}
 
-@bot.tree.command(name="work", description="Work to earn money (get 1 of 3 random jobs, 2 hour cooldown)")
+@bot.tree.command(name="game-work", description="Work to earn money (get 1 of 3 random jobs, 2 hour cooldown)")
 @app_commands.allowed_installs(guilds=True, users=False)
 async def game_work(interaction: discord.Interaction):
     user_id = str(interaction.user.id)
@@ -3107,9 +3186,9 @@ async def eco_craft_add(interaction: discord.Interaction, item: str, req1_name: 
     await interaction.response.send_message(f"✅ Added recipe: **{item}** (Time: {delay}s).")
 
 
-@bot.tree.command(name="craft", description="Craft an item")
+@bot.tree.command(name="eco-craft", description="Craft an item")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def craft(interaction: discord.Interaction, item: str, amount: int = 1):
+async def eco_craft(interaction: discord.Interaction, item: str, amount: int = 1):
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
@@ -3217,9 +3296,9 @@ async def eco_use_add(interaction: discord.Interaction, item: str, money: int = 
     )
 
 
-@bot.tree.command(name="use", description="Use an item from your inventory")
+@bot.tree.command(name="eco-use", description="Use an item from your inventory")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def use(interaction: discord.Interaction, item: str, number_of_times: int = 1):
+async def eco_use(interaction: discord.Interaction, item: str, number_of_times: int = 1):
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
@@ -3327,9 +3406,9 @@ async def eco_value_del(interaction: discord.Interaction, item: str):
         await interaction.response.send_message(f"❌ **{item}** doesn't have a price set.", ephemeral=True)
 
 
-@bot.tree.command(name="sell", description="Sell a specific amount of an item from your inventory")
+@bot.tree.command(name="eco-sell", description="Sell a specific amount of an item from your inventory")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def sell(interaction: discord.Interaction, item: str, amount: int = 1):
+async def eco_sell(interaction: discord.Interaction, item: str, amount: int = 1):
     if amount <= 0:
         return await interaction.response.send_message("❌ You must sell at least 1 item.", ephemeral=True)
     data = load_data()
@@ -3434,40 +3513,40 @@ async def info_uses(interaction: discord.Interaction):
 
 # --- Welcome Commands ---
 
-@bot.tree.command(name="adm-welcome-add", description="Set the channel for welcome images")
+@bot.tree.command(name="welcome-add", description="Set the channel for welcome images")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def adm_welcome_add(interaction: discord.Interaction, channel: discord.TextChannel):
+async def welcome_add(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["welcome_channel_id"] = channel.id
     save_guild_data(data)
     await interaction.response.send_message(f"✅ Welcome images will now be sent to {channel.mention}")
 
 
-@bot.tree.command(name="adm-welcome-del", description="Disable welcome images for this server")
+@bot.tree.command(name="welcome-del", description="Disable welcome images for this server")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def adm_welcome_del(interaction: discord.Interaction):
+async def welcome_del(interaction: discord.Interaction):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["welcome_channel_id"] = None
     save_guild_data(data)
     await interaction.response.send_message("✅ Welcome images have been disabled.")
 
 
-@bot.tree.command(name="adm-goodbye-add", description="Set the channel for goodbye images")
+@bot.tree.command(name="goodbye-add", description="Set the channel for goodbye images")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def adm_goodbye_add(interaction: discord.Interaction, channel: discord.TextChannel):
+async def goodbye_add(interaction: discord.Interaction, channel: discord.TextChannel):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["goodbye_channel_id"] = channel.id
     save_guild_data(data)
     await interaction.response.send_message(f"✅ Goodbye images will now be sent to {channel.mention}")
 
 
-@bot.tree.command(name="adm-goodbye-del", description="Disable goodbye images for this server")
+@bot.tree.command(name="goodbye-del", description="Disable goodbye images for this server")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
-async def adm_goodbye_del(interaction: discord.Interaction):
+async def goodbye_del(interaction: discord.Interaction):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["goodbye_channel_id"] = None
     save_guild_data(data)
@@ -3585,7 +3664,7 @@ async def create_goodbye_card(member):
 
 # --- Shard Info Command ---
 
-@bot.tree.command(name="shard-info", description="(owner) Display shard status and guild distribution")
+@bot.tree.command(name="own-shard-info", description="(owner) Display shard status and guild distribution")
 @app_commands.allowed_installs(guilds=True, users=False)
 async def shard_info(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
@@ -3608,7 +3687,7 @@ async def shard_info(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-@bot.tree.command(name="shard-map", description="Owner-only: Show which guilds are assigned to each shard")
+@bot.tree.command(name="own-shard-map", description="(owner) Show which guilds are assigned to each shard")
 async def shard_map(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
         return await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
@@ -3625,10 +3704,7 @@ async def shard_map(interaction: discord.Interaction):
     )
     for shard_id in sorted(shard_map.keys()):
         guild_list = shard_map[shard_id]
-        if len(guild_list) > 12:
-            value = f"{len(guild_list)} servers assigned. Too many to list in the embed."
-        else:
-            value = "\n".join(guild_list)
+        value = "\n".join(guild_list)
         embed.add_field(name=f"Shard {shard_id}", value=value, inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -3651,7 +3727,7 @@ async def on_guild_channel_delete(channel):
         save_lock_config(locked_channels, admin_log_channels)
 
 
-@bot.tree.command(name="lock-add", description="Lock this channel — messages will be logged and deleted.")
+@bot.tree.command(name="lock-add", description="Lock this channel - messages will be logged and deleted.")
 @app_commands.allowed_installs(guilds=True, users=False)
 @app_commands.default_permissions(manage_guild=True)
 async def lock_command(interaction: discord.Interaction):
@@ -3889,7 +3965,7 @@ async def view_level(interaction: discord.Interaction, user: discord.Member = No
     progress_bar = (filled_emoji * filled_blocks) + (empty_emoji * empty_blocks)
     
     embed = discord.Embed(
-        title=f"🏆 Rank Profile — {target.display_name}",
+        title=f"🏆 Rank Profile - {target.display_name}",
         color=discord.Color.dark_gray()
     )
     embed.set_thumbnail(url=target.display_avatar.url)
@@ -3912,13 +3988,13 @@ async def level_leaderboard(interaction: discord.Interaction):
         
     sorted_users = sorted(users_dict.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)
     
-    embed = discord.Embed(title=f"📊 Level Standings Leaderboard — {interaction.guild.name}", color=discord.Color.gold())
+    embed = discord.Embed(title=f"📊 Level Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
     
     description_text = ""
     for index, (u_id, data) in enumerate(sorted_users[:10], start=1):
         member = interaction.guild.get_member(int(u_id))
         name_str = member.display_name if member else f"User left server (`{u_id}`)"
-        description_text += f"`#{index}` **{name_str}** — Lvl {data['level']} ({data['xp']} XP)\n"
+        description_text += f"`#{index}` **{name_str}** - Lvl {data['level']} ({data['xp']} XP)\n"
         
     embed.description = description_text
     await interaction.response.send_message(embed=embed)
@@ -4056,6 +4132,93 @@ async def lvl_rewards_set(interaction: discord.Interaction, level: int, role: di
     await interaction.response.send_message(
         f"🎁 Level {level} reward configured: {', '.join(reward_parts)}.", ephemeral=True
     )
+
+
+def format_level_reward_summary(guild: discord.Guild, level: str, reward_data: dict) -> str:
+    parts = []
+
+    role_id = reward_data.get("role_id")
+    if role_id:
+        role = guild.get_role(role_id)
+        parts.append(f"Role: {role.mention if role else f'`{role_id}`'}")
+
+    temp_role_id = reward_data.get("temp_role_id")
+    if temp_role_id:
+        role = guild.get_role(temp_role_id)
+        duration = reward_data.get("duration", 0)
+        parts.append(f"Temp role: {role.mention if role else f'`{temp_role_id}`'} for `{duration}s`")
+
+    money = reward_data.get("money", 0)
+    if money > 0:
+        parts.append(f"Money: `${money}`")
+
+    xp = reward_data.get("xp", 0)
+    if xp > 0:
+        parts.append(f"XP: `{xp}`")
+
+    give_item = reward_data.get("give_item")
+    if give_item:
+        amount = reward_data.get("give_item_amount", 1)
+        parts.append(f"Item: `{amount}x {give_item}`")
+
+    if not parts:
+        return f"Level {level}: No rewards configured."
+
+    return f"Level {level}: " + " | ".join(parts)
+
+
+@bot.tree.command(name="info-lvl-rewards", description="Show the level rewards configured for this guild")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.describe(level="Optional specific level to inspect")
+async def info_lvl_rewards(interaction: discord.Interaction, level: int = None):
+    levels = load_levels()
+    g_id = str(interaction.guild_id)
+    guild_data = levels.get(g_id, {})
+    rewards = guild_data.get("config", {}).get("rewards", {})
+
+    if not rewards:
+        return await interaction.response.send_message("📭 No level rewards are configured for this server yet.", ephemeral=True)
+
+    embed = discord.Embed(
+        title=f"🎁 Level Rewards - {interaction.guild.name}",
+        color=discord.Color.gold()
+    )
+
+    if level is not None:
+        reward_data = rewards.get(str(level))
+        if not reward_data:
+            return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+
+        embed.description = format_level_reward_summary(interaction.guild, str(level), reward_data)
+    else:
+        sorted_levels = sorted(rewards.items(), key=lambda item: int(item[0]))
+        embed.description = "\n".join(
+            format_level_reward_summary(interaction.guild, lvl, reward_data)
+            for lvl, reward_data in sorted_levels
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="lvl-rewards-del", description="(Admin) Delete all rewards configured for a level")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.describe(level="The level whose rewards should be removed")
+async def lvl_rewards_del(interaction: discord.Interaction, level: int):
+    levels = load_levels()
+    g_id = str(interaction.guild_id)
+
+    if g_id not in levels or "config" not in levels[g_id] or "rewards" not in levels[g_id]["config"]:
+        return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+
+    rewards = levels[g_id]["config"]["rewards"]
+    if str(level) not in rewards:
+        return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+
+    del rewards[str(level)]
+    save_levels(levels)
+
+    await interaction.response.send_message(f"🗑️ Removed all rewards configured for level {level}.", ephemeral=True)
 
 # Run the bot
 bot.run(TOKEN)
