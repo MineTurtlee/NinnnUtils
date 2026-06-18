@@ -13,3 +13,5 @@ this bot adds:
 Install Link https://discord.com/oauth2/authorize?client_id=1500798502735708281
 
 Support Server https://discord.gg/FSBPvc9zqY
+
+ToS and Privacy policy https://imninnn.github.io
