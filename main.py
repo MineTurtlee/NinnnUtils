@@ -1,25 +1,26 @@
-import subprocess
 import asyncio
 import ast
 import json
 import os
 import random
+import time
 from datetime import datetime, timedelta
 from collections import Counter
-import sys
 import yt_dlp
 import discord
 from discord import TextInput, app_commands, Status
 from discord.ext import tasks, commands
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
-from google import genai
 import io
-import deep_translator
 from deep_translator import GoogleTranslator
-import g4f
 import base64
+import queue
+import threading
+import traceback
 from discord.ui import Modal, TextInput
+from pypresence import Presence
+from pypresence.types import ActivityType
 
 
 
@@ -34,6 +35,7 @@ from discord.ui import Modal, TextInput
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 VERSION = os.getenv('BOT_VERSION')
+RPC_CLIENT_ID = os.getenv('DISCORD_RPC_CLIENT_ID', '').strip()
 raw_blacklist = os.getenv('SERVER_BLACKLIST', '')
 BLACKLISTED_GUILDS = [int(sid.strip()) for sid in raw_blacklist.split(',') if sid.strip().isdigit()]
 ACTIVITY_TEXT = os.getenv('ACTIVITY')
@@ -125,10 +127,15 @@ FFMPEG_OPTIONS = {
 message_cache = []
 deleted_cache = []
 edited_cache = []
+bot_error_cache = []
 active_minigame_users = set()
 server_pauses = {}
 all_paused_guilds = set()
 reaction_xp_cooldowns = {}
+local_rpc = None
+local_rpc_thread = None
+local_rpc_stop_event = threading.Event()
+local_rpc_queue = queue.Queue(maxsize=1)
 
 
 
@@ -189,9 +196,145 @@ def save_user_settings(data):
         json.dump(data, f, indent=4)
 
 
+def get_user_settings_entry(settings: dict, user_id: str) -> dict:
+    if "users" not in settings or not isinstance(settings["users"], dict):
+        settings["users"] = {}
+
+    user_key = str(user_id)
+    user_settings = settings["users"].get(user_key)
+    if not isinstance(user_settings, dict):
+        user_settings = {}
+        settings["users"][user_key] = user_settings
+
+    return user_settings
+
+
 def get_user_color(user_id: str) -> str:
     settings = load_user_settings()
-    return settings.get("users", {}).get(str(user_id), {}).get("color", "white")
+    return get_user_settings_entry(settings, user_id).get("color", "white")
+
+
+def get_user_pings_enabled(user_id: str) -> bool:
+    settings = load_user_settings()
+    return get_user_settings_entry(settings, user_id).get("user_pings", True)
+
+
+def format_user_reference(user: discord.abc.User | discord.Member, settings: dict | None = None) -> str:
+    if settings is None:
+        settings = load_user_settings()
+
+    if get_user_settings_entry(settings, user.id).get("user_pings", True):
+        return user.mention
+
+    return getattr(user, "display_name", getattr(user, "name", str(user)))
+
+
+def get_banner_name(member: discord.abc.User | discord.Member) -> str:
+    display_name = member.display_name
+    if any(ord(char) > 127 for char in display_name):
+        return member.name
+    return display_name
+
+
+def format_banner_username(name: str, limit: int = 17) -> str:
+    if len(name) <= limit:
+        return name
+    return name[:limit] + "..."
+
+
+def start_local_rpc_worker():
+    global local_rpc_thread
+    if not RPC_CLIENT_ID:
+        return
+    if local_rpc_thread is not None and local_rpc_thread.is_alive():
+        return
+    local_rpc_thread = None
+
+    def worker():
+        global local_rpc, local_rpc_thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        client = None
+        start_timestamp = time.time()
+
+        try:
+            client = Presence(RPC_CLIENT_ID, loop=loop)
+            client.connect()
+            local_rpc = client
+
+            while not local_rpc_stop_event.is_set():
+                try:
+                    activity_text = local_rpc_queue.get(timeout=1)
+                except queue.Empty:
+                    continue
+
+                if activity_text is None:
+                    break
+
+                try:
+                    client.update(activity_type=ActivityType.LISTENING, 
+                                  name=f"{bot.user}",
+                                  state=activity_text, 
+                                  details=f"Running {bot.user.name} bot",
+                                  start=start_timestamp,
+                                  buttons=[{"label": "Git", "url": "https://github.com/ImNinnn/NinnnUtils"},{"label": "Support Server", "url": "https://discord.gg/FSBPvc9zqY"}]
+                    )
+                except Exception as e:
+                    print(f"<:warning:1517452174991556758> Local RPC sync failed: {e}")
+                    break
+        except Exception as e:
+            print(f"<:warning:1517452174991556758> Local RPC sync failed: {e}")
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
+            local_rpc = None
+            local_rpc_thread = None
+            loop.close()
+
+    local_rpc_stop_event.clear()
+    local_rpc_thread = threading.Thread(target=worker, name="LocalRPC", daemon=True)
+    local_rpc_thread.start()
+
+
+def sync_local_rpc(activity_text: str):
+    if not RPC_CLIENT_ID:
+        return
+
+    start_local_rpc_worker()
+
+    try:
+        while not local_rpc_queue.empty():
+            local_rpc_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        local_rpc_queue.put_nowait(activity_text)
+    except queue.Full:
+        pass
+
+
+def close_local_rpc():
+    global local_rpc_thread
+
+    local_rpc_stop_event.set()
+    try:
+        while not local_rpc_queue.empty():
+            local_rpc_queue.get_nowait()
+    except queue.Empty:
+        pass
+
+    try:
+        local_rpc_queue.put_nowait(None)
+    except queue.Full:
+        pass
+
+    if local_rpc_thread is not None:
+        local_rpc_thread.join(timeout=5)
+        local_rpc_thread = None
 
 
 def load_love_data():
@@ -278,6 +421,7 @@ def get_guild_config(guild_id: str) -> dict:
         "goodbye_channel_id": None,
         "ghost_ping_enabled": False,
         "edit_delete_history_enabled": True,
+        "level_up_message_enabled": False,
         "counter_channels": {}
     }
 
@@ -444,13 +588,13 @@ def apply_counter_result(message: discord.Message, result: str):
     if result == "ok":
         current = config.get("current_value", 0) + 1
         update_counter_state(guild_id, channel_id, current, message.author.id)
-        return "✅"
+        return "<:approve:1517452125687513158>"
     if result == "warn":
-        return "⚠️"
+        return "<:warning:1517452174991556758>"
     if result == "bad":
         if config.get("reset_on_fail"):
             update_counter_state(guild_id, channel_id, 0, None)
-        return "❌"
+        return "<:disapprove:1517452151012589662>"
     return None
 
 
@@ -497,11 +641,56 @@ def is_server_owner(interaction: discord.Interaction):
 
 
 def clean_cache():
-    global message_cache, deleted_cache, edited_cache
+    global message_cache, deleted_cache, edited_cache, bot_error_cache
     now = datetime.now()
     message_cache = [m for m in message_cache if now - m['time'] < timedelta(minutes=120)]
     deleted_cache = [m for m in deleted_cache if now - m['time'] < timedelta(minutes=120)]
     edited_cache = [m for m in edited_cache if now - m['time'] < timedelta(minutes=120)]
+    bot_error_cache = [m for m in bot_error_cache if now - m['time'] < timedelta(minutes=120)]
+
+
+def add_bot_error(interaction: discord.Interaction, error: Exception):
+    global bot_error_cache
+
+    if interaction.guild is None:
+        return
+
+    command_name = getattr(getattr(interaction, "command", None), "qualified_name", None)
+    if not command_name:
+        command_name = getattr(getattr(interaction, "command", None), "name", "unknown command")
+
+    bot_error_cache.append({
+        "guild_id": interaction.guild.id,
+        "channel_id": interaction.channel_id,
+        "user": interaction.user,
+        "command_name": command_name,
+        "error_type": type(error).__name__,
+        "error_message": str(error) or "No error message provided",
+        "time": datetime.now(),
+    })
+
+    if len(bot_error_cache) > 100:
+        bot_error_cache = bot_error_cache[-100:]
+
+
+def add_bot_error_entry(guild_id: int | None, channel_id: int | None, user, source: str, error: Exception):
+    global bot_error_cache
+
+    if guild_id is None:
+        return
+
+    bot_error_cache.append({
+        "guild_id": guild_id,
+        "channel_id": channel_id,
+        "user": user,
+        "command_name": source,
+        "error_type": type(error).__name__,
+        "error_message": str(error) or "No error message provided",
+        "time": datetime.now(),
+    })
+
+    if len(bot_error_cache) > 100:
+        bot_error_cache = bot_error_cache[-100:]
 
 
 def normalize_item(name: str) -> str:
@@ -589,17 +778,29 @@ async def update_board(payload, emoji_str, remove_mode=False):
         try:
             board_message = await board_channel.fetch_message(board_msg_id)
             if current_count >= config["required_count"]:
-                await board_message.edit(content=content_text, embed=embed)
+                try:
+                    await board_message.edit(content=content_text, embed=embed)
+                except discord.Forbidden as error:
+                    add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board edit", error)
             else:
-                await board_message.delete()
+                try:
+                    await board_message.delete()
+                except discord.Forbidden as error:
+                    add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board delete", error)
                 del config["tracked_messages"][orig_msg_id]
                 save_board_data(board_data)
+        except discord.Forbidden as error:
+            add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board fetch", error)
         except discord.NotFound:
             del config["tracked_messages"][orig_msg_id]
             save_board_data(board_data)
 
     elif current_count >= config["required_count"] and not remove_mode:
-        new_board_msg = await board_channel.send(content=content_text, embed=embed)
+        try:
+            new_board_msg = await board_channel.send(content=content_text, embed=embed)
+        except discord.Forbidden as error:
+            add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board post", error)
+            return
         config["tracked_messages"][orig_msg_id] = str(new_board_msg.id)
         save_board_data(board_data)
 
@@ -634,13 +835,13 @@ class ShopView(discord.ui.View):
             price = info['price']
 
             if user_data["balance"] < price:
-                await interaction.response.send_message("❌ You can't afford this!", ephemeral=True)
+                await interaction.response.send_message("<:disapprove:1517452151012589662> You can't afford this!", ephemeral=True)
                 return
 
             user_data["balance"] -= price
             inventory_add(user_data["inventory"], name)
             save_data(data)
-            await interaction.response.send_message(f"✅ You bought **{name}**!", ephemeral=True)
+            await interaction.response.send_message(f"<:approve:1517452125687513158> You bought **{name}**!", ephemeral=True)
 
         button.callback = button_callback
         self.add_item(button)
@@ -670,7 +871,7 @@ class DeletedMediaView(discord.ui.View):
         if self.revealed:
             text_content = msg['content'] if msg['content'] else "No text"
             embed = discord.Embed(
-                title=f"🗑️ Media sent by {msg['author'].display_name}",
+                title=f"<:trash:1517497581058527404> Media sent by {msg['author'].display_name}",
                 description=f"**{msg['author'].display_name}**: {text_content}\n-# Sent at {msg['created_at']}",
                 color=discord.Color.red()
             )
@@ -689,7 +890,7 @@ class DeletedMediaView(discord.ui.View):
     @discord.ui.button(label="Reveal Media", style=discord.ButtonStyle.danger)
     async def reveal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.requester:
-            await interaction.response.send_message("❌ Only the person who ran the command can reveal media!", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> Only the person who ran the command can reveal media!", ephemeral=True)
             return
         self.revealed = not self.revealed
         await self.handle_page_update(interaction)
@@ -697,7 +898,7 @@ class DeletedMediaView(discord.ui.View):
     @discord.ui.button(label="Previous media", style=discord.ButtonStyle.primary)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.requester:
-            await interaction.response.send_message("❌ Only the person who ran the command can flip pages!", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> Only the person who ran the command can flip pages!", ephemeral=True)
             return
         if self.index > 0:
             self.index -= 1
@@ -706,7 +907,7 @@ class DeletedMediaView(discord.ui.View):
     @discord.ui.button(label="Next media", style=discord.ButtonStyle.primary)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user != self.requester:
-            await interaction.response.send_message("❌ Only the person who ran the command can flip pages!", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> Only the person who ran the command can flip pages!", ephemeral=True)
             return
         if self.index < len(self.messages) - 1:
             self.index += 1
@@ -775,6 +976,8 @@ async def on_message(message):
             if log_channel and log_channel.guild.id == guild_id:
                 try:
                     await log_channel.send(f"**[LOCKED]** `{message.author}`: {message.content}")
+                except discord.Forbidden as error:
+                    add_bot_error_entry(guild_id, log_id, message.author, "locked channel admin log", error)
                 except Exception:
                     pass
 
@@ -785,7 +988,9 @@ async def on_message(message):
         dots = "•" * min(max(len(message.content), 1), 200)
         try:
             await message.delete()
-            await message.channel.send(f"🔒 {dots}")
+            await message.channel.send(f"<:locked:1517574877257924809> {dots}")
+        except discord.Forbidden as error:
+            add_bot_error_entry(guild_id, message.channel.id, message.author, "locked channel notice", error)
         except Exception:
             pass
         return
@@ -814,13 +1019,18 @@ async def on_message(message):
             for trigger in guild_replies:
                 if trigger in message_words:
                     response = random.choice(guild_replies[trigger])
-                    await message.reply(response)
+                    try:
+                        await message.reply(response)
+                    except discord.Forbidden as error:
+                        add_bot_error_entry(message.guild.id, message.channel.id, message.author, f"auto-reply: {trigger}", error)
+                    except Exception as error:
+                        add_bot_error_entry(message.guild.id, message.channel.id, message.author, f"auto-reply: {trigger}", error)
                     break
 
         if await handle_counter_message(message):
             return
 
-        await add_xp(message.author, message.guild, random.randint(5, 10))
+        await add_xp(message.author, message.guild, random.randint(5, 10), announce_channel=message.channel)
 
     await bot.process_commands(message)
 
@@ -851,21 +1061,26 @@ async def on_message_delete(message):
                 pinged_users = [user for user in msg['mentions'] if user.id != msg['author'].id]
                 
                 if pinged_users:
-                    mentions_str = " ".join([user.mention for user in pinged_users])
+                    settings = load_user_settings()
+                    mentions_str = " ".join([format_user_reference(user, settings) for user in pinged_users])
+                    author_str = format_user_reference(msg['author'], settings)
                     
                     embed = discord.Embed(
-                        title="👻 Ghost Ping Detected!",
-                        description=f"{mentions_str}, you were pinged by {msg['author'].mention} but the message was deleted.",
+                        title="<:ghost:1517497569939558470> Ghost Ping Detected!",
+                        description=f"{mentions_str}, you were pinged by {author_str} but the message was deleted.",
                         color=discord.Color.red()
                     )
                     if msg['content']:
-                        embed.add_field(name="📋 Deleted Content:", value=msg['content'], inline=False)
+                        embed.add_field(name="<:list:1517497572770451567> Deleted Content:", value=msg['content'], inline=False)
                     
                     embed.set_footer(text=f"Sent at {msg['created_at']}")
                     
                     channel = bot.get_channel(msg['channel'])
                     if channel:
-                        await channel.send(embed=embed)
+                        try:
+                            await channel.send(embed=embed)
+                        except discord.Forbidden as error:
+                            add_bot_error_entry(message.guild.id if message.guild else None, msg['channel'], msg['author'], "ghost ping notification", error)
             break
 
 
@@ -911,7 +1126,9 @@ async def on_member_join(member):
         if channel:
             try:
                 welcome_file = await create_welcome_card(member)
-                await channel.send(f"Welcome {member.mention}!", file=welcome_file)
+                await channel.send(f"Welcome {format_user_reference(member)}!", file=welcome_file)
+            except discord.Forbidden as error:
+                add_bot_error_entry(member.guild.id, channel.id, member, "welcome banner", error)
             except Exception as e:
                 print(f"Error creating welcome card: {e}")
 
@@ -926,6 +1143,8 @@ async def on_member_remove(member):
             try:
                 goodbye_file = await create_goodbye_card(member)
                 await channel.send(f"Goodbye {member.display_name}. We'll miss you!", file=goodbye_file)
+            except discord.Forbidden as error:
+                add_bot_error_entry(member.guild.id, channel.id, member, "goodbye banner", error)
             except Exception as e:
                 print(f"Error creating goodbye card: {e}")
 
@@ -946,12 +1165,14 @@ async def on_raw_reaction_add(payload):
         last_xp = reaction_xp_cooldowns.get(cooldown_key)
         if not last_xp or (now - last_xp).total_seconds() >= 15:
             reaction_xp_cooldowns[cooldown_key] = now
-            await add_xp(reactor, guild, random.randint(1, 3))
+            await add_xp(reactor, guild, random.randint(1, 3), announce_channel=guild.get_channel(payload.channel_id))
         try:
             channel = guild.get_channel(payload.channel_id)
             message = await channel.fetch_message(payload.message_id)
             if message.author and not message.author.bot and message.author.id != payload.user_id:
-                await add_xp(message.author, guild, random.randint(3, 5))
+                await add_xp(message.author, guild, random.randint(3, 5), announce_channel=channel)
+        except discord.Forbidden as error:
+            add_bot_error_entry(payload.guild_id, payload.channel_id, None, "reaction xp source fetch", error)
         except Exception:
             pass
 
@@ -976,6 +1197,9 @@ async def on_raw_reaction_add(payload):
         return
     try:
         message = await channel.fetch_message(payload.message_id)
+    except discord.Forbidden as error:
+        add_bot_error_entry(payload.guild_id, channel.id, None, "reaction board source fetch", error)
+        return
     except discord.NotFound:
         return
 
@@ -1004,12 +1228,19 @@ async def on_raw_reaction_add(payload):
         board_msg_id = int(config["tracked_messages"][message_id_str])
         try:
             board_message = await board_channel.fetch_message(board_msg_id)
-            await board_message.edit(content=content_text, embed=embed)
+            try:
+                await board_message.edit(content=content_text, embed=embed)
+            except discord.Forbidden as error:
+                add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board edit", error)
         except discord.NotFound:
             del config["tracked_messages"][message_id_str]
             save_board_data(board_data)
     elif current_count >= config["required_count"]:
-        new_board_msg = await board_channel.send(content=content_text, embed=embed)
+        try:
+            new_board_msg = await board_channel.send(content=content_text, embed=embed)
+        except discord.Forbidden as error:
+            add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board post", error)
+            return
         config["tracked_messages"][message_id_str] = str(new_board_msg.id)
         save_board_data(board_data)
 
@@ -1067,6 +1298,8 @@ async def on_raw_reaction_remove(payload):
             await board_message.delete()
             del config["tracked_messages"][message_id_str]
             save_board_data(board_data)
+    except discord.Forbidden as error:
+        add_bot_error_entry(payload.guild_id, config["channel_id"], None, "reaction board fetch", error)
     except discord.NotFound:
         del config["tracked_messages"][message_id_str]
         save_board_data(board_data)
@@ -1083,29 +1316,48 @@ async def on_raw_reaction_remove(payload):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    original_error = getattr(error, "original", error)
+    bot_missing_permissions_error = getattr(app_commands, "BotMissingPermissions", None)
+
     if isinstance(error, app_commands.CommandOnCooldown):
         retry_after = error.retry_after
         if retry_after >= 60:
             minutes = int(retry_after // 60)
             seconds = int(retry_after % 60)
             if seconds > 0:
-                message_text = f"⏳ This command is on cooldown. Please wait **{minutes}m {seconds}s** before trying again."
+                message_text = f"<:hourglass:1517574046252924938> This command is on cooldown. Please wait **{minutes}m {seconds}s** before trying again."
             else:
-                message_text = f"⏳ This command is on cooldown. Please wait **{minutes}m** before trying again."
+                message_text = f"<:hourglass:1517574046252924938> This command is on cooldown. Please wait **{minutes}m** before trying again."
         else:
             retry_after = round(retry_after, 1)
-            message_text = f"⏳ This command is on cooldown. Please wait **{retry_after}s** before trying again."
+            message_text = f"<:hourglass:1517574046252924938> This command is on cooldown. Please wait **{retry_after}s** before trying again."
         if interaction.response.is_done():
             await interaction.followup.send(message_text, ephemeral=True)
         else:
             await interaction.response.send_message(message_text, ephemeral=True)
     elif isinstance(error, app_commands.MissingPermissions):
         perms = ", ".join(error.missing_permissions)
-        await interaction.response.send_message(f"❌ You lack the required permissions to run this: `{perms}`", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> You lack the required permissions to run this: `{perms}`", ephemeral=True)
+    elif bot_missing_permissions_error is not None and isinstance(error, bot_missing_permissions_error):
+        perms = ", ".join(error.missing_permissions)
+        message_text = f"<:disapprove:1517452151012589662> I am missing the required permissions to run this: `{perms}`"
+        if interaction.response.is_done():
+            await interaction.followup.send(message_text, ephemeral=True)
+        else:
+            await interaction.response.send_message(message_text, ephemeral=True)
+    elif isinstance(original_error, discord.Forbidden):
+        message_text = "<:disapprove:1517452151012589662> I am missing the permissions required to complete that action."
+        if interaction.response.is_done():
+            await interaction.followup.send(message_text, ephemeral=True)
+        else:
+            await interaction.response.send_message(message_text, ephemeral=True)
     else:
-        print(f"Ignored exception in command tree: {error}")
+        add_bot_error(interaction, original_error)
+        command_name = getattr(getattr(interaction, "command", None), "qualified_name", None) or getattr(getattr(interaction, "command", None), "name", "unknown command")
+        print(f"Ignored exception in command tree [{command_name}]: {type(original_error).__name__}: {original_error}")
+        print("".join(traceback.format_exception(type(original_error), original_error, original_error.__traceback__)))
         if not interaction.response.is_done():
-            await interaction.response.send_message("❌ An unexpected error occurred while executing this command.", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> An unexpected error occurred while executing this command.", ephemeral=True)
 
 
 
@@ -1129,11 +1381,11 @@ async def update_presence():
 
     for guild in bot.guilds:
         if guild.id in BLACKLISTED_GUILDS:
-            print(f"🚫 Loop Check: Found blacklisted guild: {guild.name} ({guild.id}). Leaving...")
+            print(f"<:prohibited:1517497579582132436> Loop Check: Found blacklisted guild: {guild.name} ({guild.id}). Leaving...")
             try:
                 await guild.leave()
             except Exception as e:
-                print(f"❌ Failed to leave {guild.name}: {e}")
+                print(f"<:disapprove:1517452151012589662> Failed to leave {guild.name}: {e}")
 
     load_dotenv(override=True)
     VERSION = os.getenv('BOT_VERSION')
@@ -1157,12 +1409,15 @@ async def update_presence():
             shard_id=shard_id,
         )
 
+    sync_local_rpc(activity_text)
+
     presence_toggle = not presence_toggle
 
 
 @update_presence.before_loop
 async def before_update_presence():
     await bot.wait_until_ready()
+    sync_local_rpc("App just started... .. .")
     startup_activity = discord.Streaming(
         name="App just started... .. .",
         url="https://www.twitch.tv/imninnn"
@@ -1187,21 +1442,21 @@ async def on_guild_join(guild):
     raw_blacklist = os.getenv('SERVER_BLACKLIST', '')
     BLACKLISTED_GUILDS = [int(sid.strip()) for sid in raw_blacklist.split(',') if sid.strip().isdigit()]
     if guild.id in BLACKLISTED_GUILDS:
-        print(f"🚫 Joined blacklisted guild: {guild.name} ({guild.id}). Leaving immediately...")
+        print(f"<:prohibited:1517497579582132436> Joined blacklisted guild: {guild.name} ({guild.id}). Leaving immediately...")
         await guild.leave()
 
 
 async def blacklist_startup_cleanup():
     await bot.wait_until_ready()
-    print("🧹 Running startup blacklist check...")
+    print("Running startup blacklist check...")
     print('-------------------------------------')
     for guild in bot.guilds:
         if guild.id in BLACKLISTED_GUILDS:
-            print(f"🧹 Found blacklisted guild on startup: {guild.name} ({guild.id}). Leaving...")
+            print(f"Found blacklisted guild on startup: {guild.name} ({guild.id}). Leaving...")
             try:
                 await guild.leave()
             except Exception as e:
-                print(f"❌ Failed to leave {guild.name}: {e}")
+                print(f"Failed to leave {guild.name}: {e}")
 
 
 
@@ -1245,7 +1500,7 @@ async def encode_decode_command(interaction: discord.Interaction, text: str, enc
                 result = base64.b16encode(text_bytes).decode("utf-8")
             elif encoding_type == "binary":
                 result = " ".join(f"{ord(char):08b}" for char in text)
-            title_text = f"🔒 {encoding_type} Encoding Complete"
+            title_text = f"<:locked:1517574877257924809> {encoding_type} Encoding Complete"
             field_name = "Encoded Result:"
             color_choice = discord.Color.red()
         else:
@@ -1258,7 +1513,7 @@ async def encode_decode_command(interaction: discord.Interaction, text: str, enc
             elif encoding_type == "binary":
                 binary_values = text.split()
                 result = "".join(chr(int(b, 2)) for b in binary_values)
-            title_text = f"🔓 {encoding_type} Decoding Complete"
+            title_text = f"<:unlocked:1517574880034558102> {encoding_type} Decoding Complete"
             field_name = "Decoded Plain Text Result:"
             color_choice = discord.Color.green()
 
@@ -1270,11 +1525,11 @@ async def encode_decode_command(interaction: discord.Interaction, text: str, enc
         embed.add_field(name=field_name, value=f"`{result}`", inline=False)
         embed.set_footer(text=f"Processed for {interaction.user.name}", icon_url=interaction.user.display_avatar.url)
         await interaction.response.send_message(embed=embed)
-        print(f"🔑 Cipher Log: \"{interaction.user.name}\" performed {action} using {encoding_type}.")
+        print(f"Cipher Log: \"{interaction.user.name}\" performed {action} using {encoding_type}.")
 
     except Exception as e:
         await interaction.response.send_message(
-            f"❌ Operation failed. Please check that your input perfectly matches the formatting for {encoding_type}! Error: {e}",
+            f"<:disapprove:1517452151012589662> Operation failed. Please check that your input perfectly matches the formatting for {encoding_type}! Error: {e}",
             ephemeral=True
         )
 
@@ -1293,9 +1548,9 @@ async def translate(interaction: discord.Interaction, text: str, to_language: st
         translator = GoogleTranslator(source=from_language, target=to_language)
         translated_text = translator.translate(text)
         await interaction.followup.send(content=translated_text)
-        print(f"🌐 translation log : \"{interaction.user.name}\" translated \"{text}\" from {from_language} to \"{translated_text}\" in {to_language}")
+        print(f"translation log : \"{interaction.user.name}\" translated \"{text}\" from {from_language} to \"{translated_text}\" in {to_language}")
     except Exception as e:
-        await interaction.followup.send(f"❌ Translation failed. Please ensure you used valid ISO language codes! Error: {e}", ephemeral=True)
+        await interaction.followup.send(f"<:disapprove:1517452151012589662> Translation failed. Please ensure you used valid ISO language codes! Error: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="voice-play", description="Connect to your voice channel and play a YouTube audio link")
@@ -1304,7 +1559,7 @@ async def translate(interaction: discord.Interaction, text: str, to_language: st
 @app_commands.checks.cooldown(1, 30.0, key=lambda i: i.guild_id)
 async def voice_play(interaction: discord.Interaction, youtube_url: str):
     if not interaction.user.voice or not interaction.user.voice.channel:
-        await interaction.response.send_message("❌ You must be in a voice channel to use this command!", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> You must be in a voice channel to use this command!", ephemeral=True)
         return
 
     await interaction.response.defer()
@@ -1327,10 +1582,10 @@ async def voice_play(interaction: discord.Interaction, youtube_url: str):
 
         audio_source = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_PATH, **FFMPEG_OPTIONS)
         voice_client.play(audio_source, after=lambda e: print(f"Playback ended. Error: {e}") if e else None)
-        await interaction.followup.send(f"🎵 Now playing: **{video_title}** in {voice_channel.mention}!")
+        await interaction.followup.send(f"<:music:1517575582764765224> Now playing: **{video_title}** in {voice_channel.mention}!")
 
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to play audio. Error: {e}")
+        await interaction.followup.send(f"<:disapprove:1517452151012589662> Failed to play audio. Error: {e}")
 
 
 @bot.tree.command(name="voice-leave", description="Disconnect the bot from the voice channel")
@@ -1339,9 +1594,9 @@ async def voice_leave(interaction: discord.Interaction):
     voice_client = interaction.guild.voice_client
     if voice_client:
         await voice_client.disconnect()
-        await interaction.response.send_message("👋 Disconnected from the voice channel.")
+        await interaction.response.send_message("<:wave:1517576345603936296> Disconnected from the voice channel.")
     else:
-        await interaction.response.send_message("❌ I'm not connected to a voice channel!", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> I'm not connected to a voice channel!", ephemeral=True)
 
 
 @bot.tree.command(name="version", description="Display the bot's version")
@@ -1350,7 +1605,7 @@ async def voice_leave(interaction: discord.Interaction):
 async def ver(interaction: discord.Interaction):
     VERSION = os.getenv('BOT_VERSION')
     ACTIVITY_TEXT = os.getenv('ACTIVITY')
-    await interaction.response.send_message(f"⚙️ Current version: {VERSION} | {ACTIVITY_TEXT}")
+    await interaction.response.send_message(f"<:gear:1517576939097952496> Current version: {VERSION} | {ACTIVITY_TEXT}")
 
 
 @bot.tree.command(name="roll", description="Roll a 6-sided die")
@@ -1368,7 +1623,7 @@ async def roll(interaction: discord.Interaction):
 async def random_cmd(interaction: discord.Interaction, min_value: int, max_value: int):
     low, high = min(min_value, max_value), max(min_value, max_value)
     result = random.randint(low, high)
-    await interaction.response.send_message(f"🔢 Your random number between **{low}** and **{high}** is: **{result}**")
+    await interaction.response.send_message(f"<:list:1517497572770451567> Your random number between **{low}** and **{high}** is: **{result}**")
 
 
 @bot.tree.command(name="serverinfo", description="Display detailed information about this server")
@@ -1382,7 +1637,7 @@ async def serverinfo(interaction: discord.Interaction):
     human_count = total_count - bot_count
 
     embed = discord.Embed(title=f"Information for {guild.name}", color=discord.Color.blue())
-    embed.add_field(name="👤 Server Owner", value=f"{guild.owner.mention}", inline=True)
+    embed.add_field(name="👤 Server Owner", value=f"{format_user_reference(guild.owner)}", inline=True)
     embed.add_field(name="📆 Created At", value=created_at, inline=True)
     embed.add_field(name="📥 Joined At (user)", value=joined_at, inline=True)
     vanity = guild.vanity_url_code if guild.vanity_url_code else "-"
@@ -1503,7 +1758,7 @@ class CustomEmbedModal(Modal):
         app_commands.Choice(name="🟡 Yellow", value="yellow"),
         app_commands.Choice(name="🟣 Purple", value="purple"),
         app_commands.Choice(name="⚫ Dark Grey", value="dark"),
-        app_commands.Choice(name="✨ Random Color", value="random")
+        app_commands.Choice(name="<:spark:1517583248421552305> Random Color", value="random")
     ]
 )
 async def embed_builder(
@@ -1589,8 +1844,8 @@ async def love(interaction: discord.Interaction, item1: str, item2: str):
         love_data[guild_id][match_key] = score
         save_love_data(love_data)
     filled = max(0, int(score / 10))
-    bar = "🟥" * filled + "⬛" * (10 - filled)
-    embed = discord.Embed(title="Love Compatibility ❤️", color=discord.Color.red())
+    bar = "<:Square_Red:1517679897068306522>" * filled + "<:Square_Black:1517679889615032540>" * (10 - filled)
+    embed = discord.Embed(title="Love Compatibility <:heart:1517577673763979344>", color=discord.Color.red())
     embed.add_field(name="Match", value=f"{item1} & {item2}", inline=False)
     embed.add_field(name="Compatibility", value=f"**{score}%**\n{bar}", inline=False)
     await interaction.response.send_message(embed=embed)
@@ -1601,7 +1856,7 @@ async def love(interaction: discord.Interaction, item1: str, item2: str):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def ping(interaction: discord.Interaction):
     latency = round(bot.latency * 1000)
-    await interaction.response.send_message(f"🏓 Pong! Latency is **{latency}ms**")
+    await interaction.response.send_message(f"<:gear:1517576939097952496> Pong! Latency is **{latency}ms**")
 
 
 @bot.tree.command(name="stats", description="Show bot statistics and status")
@@ -1613,16 +1868,16 @@ async def stats(interaction: discord.Interaction):
     total_members = sum(guild.member_count for guild in bot.guilds)
     total_guilds = len(bot.guilds)
     embed = discord.Embed(
-        title="⚙️ Bot Statistics",
+        title="<:gear:1517576939097952496> Bot Statistics",
         color=discord.Color.gold(),
         description="Current status and technical details of the bot."
     )
     embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else bot.user.default_avatar.url)
     embed.add_field(name="🌐 Servers", value=str(total_guilds), inline=True)
     embed.add_field(name="👥 Total Users", value=str(total_members), inline=True)
-    embed.add_field(name="⏳ Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="<:hourglass:1517574046252924938> Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
     embed.add_field(name="🐍 Library", value=f"discord.py {discord.__version__}", inline=True)
-    embed.add_field(name="⚙️ Version", value=f"{VERSION} | {ACTIVITY_TEXT}", inline=True)
+    embed.add_field(name="<:gear:1517576939097952496> Version", value=f"{VERSION} | {ACTIVITY_TEXT}", inline=True)
     guild_shard_id = interaction.guild.shard_id if interaction.guild else 0
     total_shards = len(bot.shards) or 1
     shard_info = f"Shard id: {guild_shard_id} | total: {total_shards}"
@@ -1635,7 +1890,7 @@ async def stats(interaction: discord.Interaction):
 @app_commands.allowed_installs(guilds=True, users=True)
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def slot(interaction: discord.Interaction):
-    emojis = ['🍒', '🍎', '🍇', '💎', '🔔', '🍋']
+    emojis = ['🍒', '🍎', '🍇', '💎', '<:bell:1517497562184024275>', '🍋']
     await interaction.response.send_message("🎰 **Spinning...**")
     for _ in range(3):
         e1, e2, e3 = (random.choice(emojis) for _ in range(3))
@@ -1689,13 +1944,13 @@ async def banner(interaction: discord.Interaction, user: discord.Member = None):
 @app_commands.describe(emoji="The custom emoji to get the image from")
 async def emoji(interaction: discord.Interaction, emoji: str):
     if not emoji:
-        return await interaction.response.send_message("❌ Please provide a valid custom emoji.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Please provide a valid custom emoji.", ephemeral=True)
     try:
         emoji_obj = discord.PartialEmoji.from_str(emoji)
     except Exception:
-        return await interaction.response.send_message("❌ Please provide a valid custom emoji.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Please provide a valid custom emoji.", ephemeral=True)
     if not emoji_obj.id:
-        return await interaction.response.send_message("❌ Please provide a valid custom emoji.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Please provide a valid custom emoji.", ephemeral=True)
     embed = discord.Embed(title=f"Emoji: {emoji_obj.name}", color=discord.Color.blue())
     embed.set_image(url=emoji_obj.url)
     await interaction.response.send_message(embed=embed)
@@ -1722,12 +1977,12 @@ async def adm_voice_move(interaction: discord.Interaction, channel: discord.Voic
         member = interaction.guild.get_member(interaction.user.id)
 
     if not member or not member.voice or not member.voice.channel:
-        await interaction.response.send_message("❌ You must be connected to a voice channel to use this command.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> You must be connected to a voice channel to use this command.", ephemeral=True)
         return
 
     source_channel = member.voice.channel
     if source_channel.id == channel.id:
-        await interaction.response.send_message("✅ You are already in the target voice channel.", ephemeral=True)
+        await interaction.response.send_message("<:approve:1517452125687513158> You are already in the target voice channel.", ephemeral=True)
         return
 
     moved_members = []
@@ -1762,19 +2017,19 @@ async def adm_voice_move(interaction: discord.Interaction, channel: discord.Voic
 )
 async def rename(interaction: discord.Interaction, user: discord.Member, name: str = None):
     if interaction.guild.me.top_role <= user.top_role:
-        await interaction.response.send_message("❌ I cannot rename this user. Their role is higher than or equal to mine!", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> I cannot rename this user. Their role is higher than or equal to mine!", ephemeral=True)
         return
     try:
         old_name = user.display_name
         await user.edit(nick=name)
         if name:
-            await interaction.response.send_message(f"✅ Changed **{old_name}**'s nickname to **{name}**.")
+            await interaction.response.send_message(f"<:approve:1517452125687513158> Changed **{old_name}**'s nickname to **{name}**.")
         else:
-            await interaction.response.send_message(f"✅ Reset **{old_name}**'s nickname to their original username.")
+            await interaction.response.send_message(f"<:approve:1517452125687513158> Reset **{old_name}**'s nickname to their original username.")
     except discord.Forbidden:
-        await interaction.response.send_message("❌ I don't have the 'Manage Nicknames' permission or the user is the Server Owner.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> I don't have the 'Manage Nicknames' permission or the user is the Server Owner.", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> An error occurred: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="adm-purge-nuke", description="Fully clear a channel")
@@ -1784,22 +2039,25 @@ async def nuke(interaction: discord.Interaction, archive: bool = False):
     try:
         channel = await interaction.guild.fetch_channel(interaction.channel_id)
     except discord.Forbidden:
-        await interaction.response.send_message("❌ I cannot 'see' this channel. Please check my permissions in this specific channel's settings.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> I cannot 'see' this channel. Please check my permissions in this specific channel's settings.", ephemeral=True)
         return
 
     GIF_URL = "https://media0.giphy.com/media/v1.Y2lkPTc5MGI3NjExN2x1ZW82ZGdlZzV1MTFzNGF6ajJzZ3Bmc3I2MDlxaXp0cWpkcTY4YyZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/fXhYwggfsp3yHBsdlr/giphy.gif"
 
-    await interaction.response.send_message("💣 Target locked. Nuking...", ephemeral=False)
+    await interaction.response.send_message("<:explosive:1517578642723573880> Target locked. Nuking...", ephemeral=False)
     new_channel = await channel.clone(reason=f"Nuke by {interaction.user}")
     await new_channel.edit(position=channel.position)
 
     embed = discord.Embed(
-        title="☢️ Channel Nuked",
-        description=f"This is {interaction.user.mention}'s fault, THEY DID THIS",
+        title="<:nuke:1517497573986926732> Channel Nuked",
+        description=f"This is {format_user_reference(interaction.user)}'s fault, THEY DID THIS",
         color=discord.Color.red()
     )
     embed.set_image(url=GIF_URL)
-    await new_channel.send(embed=embed)
+    try:
+        await new_channel.send(embed=embed)
+    except discord.Forbidden as error:
+        add_bot_error_entry(interaction.guild.id, new_channel.id, interaction.user, "nuke result message", error)
 
     try:
         if archive:
@@ -1812,7 +2070,10 @@ async def nuke(interaction: discord.Interaction, archive: bool = False):
         else:
             await channel.delete(reason="Nuked")
     except discord.Forbidden:
-        await new_channel.send("⚠️ **Warning:** I couldn't delete or hide the old channel. Check if my role is high enough!")
+        try:
+            await new_channel.send("<:warning:1517452174991556758> **Warning:** I couldn't delete or hide the old channel. Check if my role is high enough!")
+        except discord.Forbidden as error:
+            add_bot_error_entry(interaction.guild.id, new_channel.id, interaction.user, "nuke cleanup warning", error)
     except Exception as e:
         print(f"Error during nuke cleanup: {e}")
 
@@ -1826,10 +2087,10 @@ async def nuke(interaction: discord.Interaction, archive: bool = False):
 )
 async def purge(interaction: discord.Interaction, amount: int, user: discord.Member = None):
     if amount <= 0:
-        await interaction.response.send_message("❌ Please specify a number greater than 0.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> Please specify a number greater than 0.", ephemeral=True)
         return
     if amount > 100:
-        await interaction.response.send_message("⚠️ For safety, you can only purge up to 100 messages at a time.", ephemeral=True)
+        await interaction.response.send_message("<:warning:1517452174991556758> For safety, you can only purge up to 100 messages at a time.", ephemeral=True)
         return
 
     await interaction.response.defer(ephemeral=False)
@@ -1839,10 +2100,10 @@ async def purge(interaction: discord.Interaction, amount: int, user: discord.Mem
 
     try:
         deleted = await interaction.channel.purge(limit=amount, check=is_user, before=interaction.created_at)
-        user_str = f" from {user.mention}" if user else ""
-        await interaction.followup.send(f"💣 Successfully deleted **{len(deleted)}** messages{user_str}.", ephemeral=False)
+        user_str = f" from {format_user_reference(user)}" if user else ""
+        await interaction.followup.send(f"<:explosive:1517578642723573880> Successfully deleted **{len(deleted)}** messages{user_str}.", ephemeral=False)
     except Exception as e:
-        await interaction.followup.send(f"❌ Failed to purge messages. Error: {e}", ephemeral=True)
+        await interaction.followup.send(f"<:disapprove:1517452151012589662> Failed to purge messages. Error: {e}", ephemeral=True)
 
 
 @bot.tree.command(name="adm-timeout", description="Timeout a member for a specific duration")
@@ -1859,46 +2120,47 @@ async def purge(interaction: discord.Interaction, amount: int, user: discord.Mem
 async def timeout(interaction: discord.Interaction, member: discord.Member, days: int = 0, hours: int = 0, minutes: int = 0, seconds: int = 0, reason: str = "No reason provided"):
     duration = timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
     if duration.total_seconds() <= 0:
-        await interaction.response.send_message("❌ You must specify a duration greater than 0!", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> You must specify a duration greater than 0!", ephemeral=True)
         return
     if duration.total_seconds() > 2419200:
-        await interaction.response.send_message("❌ Timeout cannot exceed 28 days.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> Timeout cannot exceed 28 days.", ephemeral=True)
         return
 
     if interaction.user != member and member.top_role >= interaction.user.top_role:
-        await interaction.response.send_message("❌ You cannot timeout someone with an equal or higher role than yours.", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> You cannot timeout someone with an equal or higher role than yours.", ephemeral=True)
         return
 
     time_str = f"{days}d {hours}h {minutes}m {seconds}s"
-    try:
-        dm_embed = discord.Embed(
-            title="⏳ You have been timed out",
-            description=f"**Server:** {interaction.guild.name}\n**Duration:** {time_str}\n**Reason:** {reason}",
-            color=discord.Color.orange()
-        )
-        await member.send(embed=dm_embed)
-    except discord.Forbidden:
-        pass
+    if not member.bot:
+        try:
+            dm_embed = discord.Embed(
+                title="<:hourglass:1517574046252924938> You have been timed out",
+                description=f"**Server:** {interaction.guild.name}\n**Duration:** {time_str}\n**Reason:** {reason}",
+                color=discord.Color.orange()
+            )
+            await member.send(embed=dm_embed)
+        except (discord.Forbidden, discord.HTTPException):
+            pass
 
     try:
         await member.timeout(duration, reason=reason)
         confirm_embed = discord.Embed(
-            title="✅ User Timed Out",
-            description=f"**{member.mention}** has been timed out for {time_str}.",
+            title="<:approve:1517452125687513158> User Timed Out",
+            description=f"**{format_user_reference(member)}** has been timed out for {time_str}.",
             color=discord.Color.green()
         )
         confirm_embed.add_field(name="Reason", value=reason)
         await interaction.response.send_message(embed=confirm_embed)
     except discord.Forbidden:
-        await interaction.response.send_message("❌ I don't have permission to timeout this user (Hierarchy issue).", ephemeral=True)
+        await interaction.response.send_message("<:disapprove:1517452151012589662> I don't have permission to timeout this user (Hierarchy issue).", ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ An error occurred: {e}", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> An error occurred: {e}", ephemeral=True)
 
 
 
 
 # -------------------------------------------------------------------------------------------------------------
-#                                               Deleted Edited / Ghost Pings
+#                                               Deleted Edited / Ghost Pings / Error
 # -------------------------------------------------------------------------------------------------------------
 
 
@@ -1917,15 +2179,15 @@ async def ghost_toggle(interaction: discord.Interaction):
     
     save_guild_data(data)
     
-    status_text = "✅ **Enabled**" if new_state else "❌ **Disabled**"
+    status_text = "<:approve:1517452125687513158> **Enabled**" if new_state else "<:disapprove:1517452151012589662> **Disabled**"
     embed = discord.Embed(
-        title="👻 Ghost Ping Notifications",
+        title="<:ghost:1517497569939558470> Ghost Ping Notifications",
         description=f"Ghost ping notifications are now {status_text}",
         color=discord.Color.green() if new_state else discord.Color.red()
     )
     embed.set_footer(text="When enabled, the bot will notify users if someone pings them and then deletes the message (ghost ping).")
     await interaction.response.send_message(embed=embed, ephemeral=False)
-    print(f"👻 Ghost ping notifications {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
+    print(f"<:ghost:1517497569939558470> Ghost ping notifications {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
 
 
 @bot.tree.command(name="toggle-history", description="Enable or disable /edited and /deleted history in this guild")
@@ -1940,15 +2202,15 @@ async def history_toggle(interaction: discord.Interaction):
     guild_config["edit_delete_history_enabled"] = new_state
     save_guild_data(data)
 
-    status_text = "✅ **Enabled**" if new_state else "❌ **Disabled**"
+    status_text = "<:approve:1517452125687513158> **Enabled**" if new_state else "<:disapprove:1517452151012589662> **Disabled**"
     embed = discord.Embed(
-        title="🗄️ Edit/Delete History",
+        title="<:drawer:1517497564189036574> Edit/Delete History",
         description=f"Edited and deleted message history is now {status_text} for this server.",
         color=discord.Color.green() if new_state else discord.Color.red()
     )
     embed.set_footer(text="When disabled, /edited and /deleted commands will not show history and deleted/edited events will not be saved.")
     await interaction.response.send_message(embed=embed, ephemeral=False)
-    print(f"🗄️ Edit/Delete history {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
+    print(f"<:drawer:1517497564189036574> Edit/Delete history {'enabled' if new_state else 'disabled'} in {interaction.guild.name}")
 
 
 @bot.tree.command(name="deleted", description="View recently deleted messages and media")
@@ -1957,7 +2219,7 @@ async def deleted(interaction: discord.Interaction, user: discord.Member = None)
     clean_cache()
     guild_config, _ = get_guild_config(str(interaction.guild.id))
     if not guild_config.get("edit_delete_history_enabled", True):
-        await interaction.response.send_message("❌ Deleted message history is disabled for this server.")
+        await interaction.response.send_message("<:disapprove:1517452151012589662> Deleted message history is disabled for this server.")
         return
     channel_msgs = [m for m in deleted_cache if m['channel'] == interaction.channel_id]
     if user:
@@ -1970,7 +2232,7 @@ async def deleted(interaction: discord.Interaction, user: discord.Member = None)
     media_only_messages = []
 
     for m in channel_msgs:
-        media_indicator = "🖼️ " if m['media'] else ""
+        media_indicator = "<:image:1517497571470348539> " if m['media'] else ""
         if m['media']:
             media_only_messages.append(m)
         content_text = m['content'] if m['content'] else "*[Media or Embed]*"
@@ -1978,7 +2240,7 @@ async def deleted(interaction: discord.Interaction, user: discord.Member = None)
 
     full_description = "\n\n".join(description_lines)
     main_embed = discord.Embed(
-        title="🗑️ Recent deleted messages:",
+        title="<:trash:1517497581058527404> Recent deleted messages:",
         description=full_description,
         color=discord.Color.red()
     )
@@ -2002,7 +2264,7 @@ async def edited_command(interaction: discord.Interaction, user: discord.Member 
     clean_cache()
     guild_config, _ = get_guild_config(str(interaction.guild.id))
     if not guild_config.get("edit_delete_history_enabled", True):
-        await interaction.response.send_message("❌ Edited message history is disabled for this server.")
+        await interaction.response.send_message("<:disapprove:1517452151012589662> Edited message history is disabled for this server.")
         return
 
     channel_edited = [m for m in edited_cache if m['channel'] == interaction.channel_id]
@@ -2018,7 +2280,7 @@ async def edited_command(interaction: discord.Interaction, user: discord.Member 
     for msg in channel_edited[:7]:
         text_layout += f"**{msg['author'].display_name}**: ~~{msg['old_content']}~~ ➔ {msg['new_content']}\n-# Edited at {msg['edited_at']} | [Jump to Message]({msg['jump_url']})\n\n"
 
-    title_text = "📝 Recently Edited Messages"
+    title_text = "<:edit:1517497568421085256> Recently Edited Messages"
 
     embed_layout = discord.Embed(
         title=title_text,
@@ -2027,6 +2289,47 @@ async def edited_command(interaction: discord.Interaction, user: discord.Member 
     )
 
     await interaction.response.send_message(embed=embed_layout)
+
+
+@bot.tree.command(name="errors", description="Show recent bot errors in this server")
+@app_commands.allowed_installs(guilds=True, users=False)
+async def errors(interaction: discord.Interaction):
+    clean_cache()
+
+    guild_errors = [entry for entry in bot_error_cache if entry.get("guild_id") == interaction.guild_id]
+    if not guild_errors:
+        await interaction.response.send_message("No bot errors have been recorded for this server recently.")
+        return
+
+    recent_errors = list(reversed(guild_errors[-7:]))
+    description_lines = []
+
+    for entry in recent_errors:
+        channel_id = entry.get("channel_id")
+        if channel_id:
+            channel_text = f"<#{channel_id}>"
+        else:
+            channel_text = "Unknown channel"
+
+        user_obj = entry.get("user")
+        user_text = getattr(user_obj, "display_name", getattr(user_obj, "name", "Unknown user"))
+        error_message = entry.get("error_message", "No error message provided")
+        if len(error_message) > 180:
+            error_message = error_message[:177] + "..."
+
+        description_lines.append(
+            f"**{entry.get('command_name', 'unknown command')}** in {channel_text} by {user_text}\n"
+            f"-# {entry.get('error_type', 'Error')}: {error_message}\n"
+            f"-# At {entry['time'].strftime('%I:%M %p')}"
+        )
+
+    embed = discord.Embed(
+        title="<:warning:1517452174991556758> Recent Bot Errors",
+        description="\n\n".join(description_lines),
+        color=discord.Color.red()
+    )
+    embed.set_footer(text=f"Showing latest {len(recent_errors)} of {len(guild_errors)} error(s).")
+    await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="forget", description="Clear your messages from the bot's memory")
@@ -2077,7 +2380,7 @@ async def adm_forget(interaction: discord.Interaction, user: discord.Member):
 async def counter_channel_set(interaction: discord.Interaction, channel: discord.TextChannel, reset_when_fail: bool = False):
     set_counter_channel(str(interaction.guild.id), channel.id, reset_when_fail)
     status_text = "resets on fail" if reset_when_fail else "does not reset on fail"
-    await interaction.response.send_message(f"✅ Counter enabled in {channel.mention} and {status_text}.", ephemeral=False)
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Counter enabled in {channel.mention} and {status_text}.", ephemeral=False)
 
 
 @bot.tree.command(name="counter-del", description="Disable counting in a channel")
@@ -2089,9 +2392,9 @@ async def counter_channel_set(interaction: discord.Interaction, channel: discord
 async def counter_del(interaction: discord.Interaction, channel: discord.TextChannel):
     removed = remove_counter_channel(str(interaction.guild.id), channel.id)
     if removed:
-        await interaction.response.send_message(f"✅ Counter disabled in {channel.mention}.", ephemeral=False)
+        await interaction.response.send_message(f"<:approve:1517452125687513158> Counter disabled in {channel.mention}.", ephemeral=False)
     else:
-        await interaction.response.send_message(f"⚠️ That channel does not have an active counter.", ephemeral=True)
+        await interaction.response.send_message(f"<:warning:1517452174991556758> That channel does not have an active counter.", ephemeral=True)
 
 
 @bot.tree.command(name="counter-number-set", description="Set the current count in a counter channel")
@@ -2104,9 +2407,9 @@ async def counter_del(interaction: discord.Interaction, channel: discord.TextCha
 async def counter_number_set(interaction: discord.Interaction, channel: discord.TextChannel, value: int):
     success = set_counter_value(str(interaction.guild.id), channel.id, value)
     if success:
-        await interaction.response.send_message(f"✅ Counter in {channel.mention} is now set to {value}.", ephemeral=False)
+        await interaction.response.send_message(f"<:approve:1517452125687513158> Counter in {channel.mention} is now set to {value}.", ephemeral=False)
     else:
-        await interaction.response.send_message(f"⚠️ That channel does not have an active counter.", ephemeral=True)
+        await interaction.response.send_message(f"<:warning:1517452174991556758> That channel does not have an active counter.", ephemeral=True)
 
 
 @bot.tree.command(name="auto-reply", description="Add a trigger word and random responses for this server")
@@ -2129,7 +2432,7 @@ async def auto_reply(interaction: discord.Interaction, word: str, reply1: str, r
     fun_data[guild_id][trigger_word] = replies
     save_fun_data(fun_data)
     embed = discord.Embed(
-        title="✨ Fun Reply Added!",
+        title="<:spark:1517583248421552305> Fun Reply Added!",
         description=f"Whenever someone says **{word}** in this server, I will randomly reply with one of these:",
         color=discord.Color.purple()
     )
@@ -2152,13 +2455,13 @@ async def auto_reply_clear(interaction: discord.Interaction, word: str):
             del fun_data[guild_id]
         save_fun_data(fun_data)
         embed = discord.Embed(
-            title="🗑️ Trigger Cleared",
+            title="<:trash:1517497581058527404> Trigger Cleared",
             description=f"Successfully removed the word **{word}** from this server's auto-reply system.",
             color=discord.Color.red()
         )
         await interaction.response.send_message(embed=embed)
     else:
-        await interaction.response.send_message(f"❌ '{word}' isn't registered as a fun reply trigger in this server.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> '{word}' isn't registered as a fun reply trigger in this server.", ephemeral=True)
 
 
 
@@ -2190,7 +2493,7 @@ async def board_add(interaction: discord.Interaction, emoji: str, required_count
     }
     save_board_data(board_data)
     embed = discord.Embed(
-        title="📋 Board Configured!",
+        title="<:list:1517497572770451567> Board Configured!",
         description=f"When a message gets {required_count} {emoji} reactions, it will be sent to {channel.mention}.",
         color=discord.Color.green()
     )
@@ -2209,9 +2512,9 @@ async def board_del(interaction: discord.Interaction, emoji: str):
         if not board_data[guild_id]:
             del board_data[guild_id]
         save_board_data(board_data)
-        await interaction.response.send_message(f"🗑️ Successfully removed the board for {emoji}.")
+        await interaction.response.send_message(f"<:trash:1517497581058527404> Successfully removed the board for {emoji}.")
     else:
-        await interaction.response.send_message(f"❌ No board configuration found for {emoji} in this server.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> No board configuration found for {emoji} in this server.", ephemeral=True)
 
 
 
@@ -2245,7 +2548,7 @@ async def on_guild_channel_delete(channel):
 async def lock_command(interaction: discord.Interaction):
     locked_channels[interaction.channel_id] = True
     save_lock_config(locked_channels, admin_log_channels)
-    await interaction.response.send_message(f"🔒 Channel locked.")
+    await interaction.response.send_message(f"<:locked:1517574877257924809> Channel locked.")
 
 
 @bot.tree.command(name="lock-remove", description="Unlock this channel.")
@@ -2255,9 +2558,9 @@ async def unlock_command(interaction: discord.Interaction):
     if interaction.channel_id in locked_channels:
         locked_channels.pop(interaction.channel_id)
         save_lock_config(locked_channels, admin_log_channels)
-        await interaction.response.send_message("🔓 Channel unlocked.")
+        await interaction.response.send_message("<:unlocked:1517574880034558102> Channel unlocked.")
     else:
-        await interaction.response.send_message("⚠️ This channel is not currently locked.", ephemeral=True)
+        await interaction.response.send_message("<:warning:1517452174991556758> This channel is not currently locked.", ephemeral=True)
 
 
 @bot.tree.command(name="lock-adminadd", description="Enable admin logging in this channel.")
@@ -2266,7 +2569,7 @@ async def unlock_command(interaction: discord.Interaction):
 async def adminadd_command(interaction: discord.Interaction):
     admin_log_channels[interaction.channel_id] = True
     save_lock_config(locked_channels, admin_log_channels)
-    await interaction.response.send_message("📋 Logging enabled in this channel.")
+    await interaction.response.send_message("<:list:1517497572770451567> Logging enabled in this channel.")
 
 
 @bot.tree.command(name="lock-adminstop", description="Stop admin logging in this channel.")
@@ -2276,9 +2579,9 @@ async def adminstop_command(interaction: discord.Interaction):
     if interaction.channel_id in admin_log_channels:
         admin_log_channels.pop(interaction.channel_id)
         save_lock_config(locked_channels, admin_log_channels)
-        await interaction.response.send_message("🚫 **Logging stopped.**")
+        await interaction.response.send_message("<:prohibited:1517497579582132436> **Logging stopped.**")
     else:
-        await interaction.response.send_message("⚠️ This channel has no active logging.", ephemeral=True)
+        await interaction.response.send_message("<:warning:1517452174991556758> This channel has no active logging.", ephemeral=True)
 
 
 @bot.tree.command(name="lock-pause", description="Pause message deletion for this channel or all locked channels.")
@@ -2288,12 +2591,12 @@ async def pause_command(interaction: discord.Interaction, channel: discord.TextC
     guild_id = interaction.guild_id
     if channel is None:
         all_paused_guilds.add(guild_id)
-        await interaction.response.send_message("⏸️ Message deletion paused for all locked channels in this server.")
+        await interaction.response.send_message("<:pause:1517497575219920986> Message deletion paused for all locked channels in this server.")
         return
     if guild_id not in server_pauses:
         server_pauses[guild_id] = set()
     server_pauses[guild_id].add(channel.id)
-    await interaction.response.send_message(f"⏸️ Message deletion paused for {channel.mention}.")
+    await interaction.response.send_message(f"<:pause:1517497575219920986> Message deletion paused for {channel.mention}.")
 
 
 @bot.tree.command(name="lock-resume", description="Resume message deletion for this channel or all locked channels.")
@@ -2303,12 +2606,12 @@ async def resume_command(interaction: discord.Interaction, channel: discord.Text
     guild_id = interaction.guild_id
     if channel is None:
         all_paused_guilds.discard(guild_id)
-        await interaction.response.send_message("▶️ Message deletion resumed for all locked channels in this server.")
+        await interaction.response.send_message("<:play:1517497576855965716> Message deletion resumed for all locked channels in this server.")
         return
     if guild_id not in server_pauses:
         server_pauses[guild_id] = set()
     server_pauses[guild_id].discard(channel.id)
-    await interaction.response.send_message(f"▶️ Message deletion resumed for {channel.mention}.")
+    await interaction.response.send_message(f"<:play:1517497576855965716> Message deletion resumed for {channel.mention}.")
 
 
 
@@ -2327,7 +2630,7 @@ async def welcome_add(interaction: discord.Interaction, channel: discord.TextCha
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["welcome_channel_id"] = channel.id
     save_guild_data(data)
-    await interaction.response.send_message(f"✅ Welcome images will now be sent to {channel.mention}")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Welcome images will now be sent to {channel.mention}")
 
 
 @bot.tree.command(name="welcome-del", description="Disable welcome images for this server")
@@ -2337,7 +2640,7 @@ async def welcome_del(interaction: discord.Interaction):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["welcome_channel_id"] = None
     save_guild_data(data)
-    await interaction.response.send_message("✅ Welcome images have been disabled.")
+    await interaction.response.send_message("<:approve:1517452125687513158> Welcome images have been disabled.")
 
 
 @bot.tree.command(name="goodbye-add", description="Set the channel for goodbye images")
@@ -2347,7 +2650,7 @@ async def goodbye_add(interaction: discord.Interaction, channel: discord.TextCha
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["goodbye_channel_id"] = channel.id
     save_guild_data(data)
-    await interaction.response.send_message(f"✅ Goodbye images will now be sent to {channel.mention}")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Goodbye images will now be sent to {channel.mention}")
 
 
 @bot.tree.command(name="goodbye-del", description="Disable goodbye images for this server")
@@ -2357,7 +2660,7 @@ async def goodbye_del(interaction: discord.Interaction):
     guild_config, data = get_guild_config(str(interaction.guild.id))
     guild_config["goodbye_channel_id"] = None
     save_guild_data(data)
-    await interaction.response.send_message("✅ Goodbye images have been disabled.")
+    await interaction.response.send_message("<:approve:1517452125687513158> Goodbye images have been disabled.")
 
 
 @bot.tree.command(name="test-goodbye", description="Preview the goodbye banner for a specific user")
@@ -2369,12 +2672,12 @@ async def test_goodbye(interaction: discord.Interaction, member: discord.Member 
     try:
         goodbye_file = await create_goodbye_card(target_member)
         if goodbye_file:
-            await interaction.followup.send(f"🎨 **Goodbye Banner Preview** for {target_member.mention}:", file=goodbye_file)
+            await interaction.followup.send(f"<:image:1517497571470348539> **Goodbye Banner Preview** for {format_user_reference(target_member)}:", file=goodbye_file)
         else:
-            await interaction.followup.send("❌ Failed to generate the image. Check the console for errors.")
+            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
     except Exception as e:
         print(f"Error in test-goodbye: {e}")
-        await interaction.followup.send(f"⚠️ An error occurred: {e}")
+        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
 
 
 @bot.tree.command(name="test-welcome", description="Preview the welcome banner for a specific user")
@@ -2386,12 +2689,12 @@ async def test_welcome(interaction: discord.Interaction, member: discord.Member 
     try:
         welcome_file = await create_welcome_card(target_member)
         if welcome_file:
-            await interaction.followup.send(f"🎨 **Welcome Banner Preview** for {target_member.mention}:", file=welcome_file)
+            await interaction.followup.send(f"<:image:1517497571470348539> **Welcome Banner Preview** for {format_user_reference(target_member)}:", file=welcome_file)
         else:
-            await interaction.followup.send("❌ Failed to generate the image. Check the console for errors.")
+            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
     except Exception as e:
         print(f"Error in test-welcome: {e}")
-        await interaction.followup.send(f"⚠️ An error occurred: {e}")
+        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
 
 
 async def create_welcome_card(member):
@@ -2400,7 +2703,7 @@ async def create_welcome_card(member):
     font_path = os.path.join(base_path, "Minecraft.ttf")
 
     if not os.path.exists(bg_path):
-        print(f"❌ Background not found at: {bg_path}")
+        print(f"<:disapprove:1517452151012589662> Background not found at: {bg_path}")
         return None
 
     background = Image.open(bg_path).convert("RGBA")
@@ -2416,13 +2719,13 @@ async def create_welcome_card(member):
         font_small = ImageFont.truetype(font_path, 15)
         font_medium = ImageFont.truetype(font_path, 25)
     except Exception as e:
-        print(f"⚠️ Font error: {e}. Using default.")
+        print(f"<:warning:1517452174991556758> Font error: {e}. Using default.")
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
         font_medium = ImageFont.load_default()
 
     draw.text((35, 30), f"Welcome", fill=(255, 255, 255), font=font_big)
-    draw.text((35, 80), f"{member.display_name}", fill=(255, 255, 255), font=font_medium)
+    draw.text((35, 80), format_banner_username(get_banner_name(member), 25), fill=(255, 255, 255), font=font_medium)
     draw.text((35, 140), f"to the {member.guild.name} server", fill=(200, 200, 200), font=font_small)
 
     buffer = io.BytesIO()
@@ -2438,7 +2741,7 @@ async def create_goodbye_card(member):
     font_path = os.path.join(base_path, "Minecraft.ttf")
 
     if not os.path.exists(bg_path):
-        print(f"❌ Goodbye background not found at: {bg_path}")
+        print(f"<:disapprove:1517452151012589662> Goodbye background not found at: {bg_path}")
         return None
 
     background = Image.open(bg_path).convert("RGBA")
@@ -2454,13 +2757,13 @@ async def create_goodbye_card(member):
         font_small = ImageFont.truetype(font_path, 15)
         font_medium = ImageFont.truetype(font_path, 25)
     except Exception as e:
-        print(f"⚠️ Font error: {e}. Using default.")
+        print(f"<:warning:1517452174991556758> Font error: {e}. Using default.")
         font_big = ImageFont.load_default()
         font_small = ImageFont.load_default()
         font_medium = ImageFont.load_default()
 
     draw.text((35, 30), "Goodbye", fill=(255, 255, 255), font=font_big)
-    draw.text((35, 80), f"{member.display_name}", fill=(255, 255, 255), font=font_medium)
+    draw.text((35, 80), format_banner_username(get_banner_name(member), 25), fill=(255, 255, 255), font=font_medium)
     draw.text((35, 140), f"from {member.guild.name}", fill=(200, 200, 200), font=font_small)
     draw.text((35, 170), "We hope to see you again soon!", fill=(200, 200, 200), font=font_small)
 
@@ -2483,7 +2786,7 @@ async def create_goodbye_card(member):
 @app_commands.allowed_installs(guilds=True, users=False)
 async def eco_leaderboard(interaction: discord.Interaction, limit: int = 10):
     if limit <= 0:
-        return await interaction.response.send_message("❌ Limit must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Limit must be greater than 0.", ephemeral=True)
 
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
@@ -2508,7 +2811,7 @@ async def eco_leaderboard(interaction: discord.Interaction, limit: int = 10):
             name = f"User left server (`{uid}`)"
         description_lines.append(f"`#{idx}` **{name}** - ${bal}")
 
-    embed = discord.Embed(title=f"🏆 Economy Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
+    embed = discord.Embed(title=f"<:chalice:1517579767573123092> Economy Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
     embed.description = "\n".join(description_lines)
     await interaction.response.send_message(embed=embed)
 
@@ -2518,11 +2821,11 @@ async def eco_leaderboard(interaction: discord.Interaction, limit: int = 10):
 @app_commands.describe(user="The user you want to check (Owner only)")
 async def eco_balance(interaction: discord.Interaction, user: discord.Member = None):
     if user and interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("❌ Only the server owner can check other users' balances!", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Only the server owner can check other users' balances!", ephemeral=True)
     target = user or interaction.user
     data = load_data()
     money = data.get(str(interaction.guild.id), {}).get("users", {}).get(str(target.id), {}).get("balance", 0)
-    await interaction.response.send_message(f"💰 {target.display_name}'s balance: **${money}**")
+    await interaction.response.send_message(f"<:money:1517580310395486239> {target.display_name}'s balance: **${money}**")
 
 
 @bot.tree.command(name="eco-daily", description="Claim your daily reward")
@@ -2534,24 +2837,24 @@ async def eco_daily(interaction: discord.Interaction):
     earnings = random.randint(150, 200)
     user_data["balance"] += earnings
     save_data(data)
-    await interaction.response.send_message(f"💵 You claimed your daily reward and earned **${earnings}**!")
+    await interaction.response.send_message(f"<:money:1517580310395486239> You claimed your daily reward and earned **${earnings}**!")
 
 
 @bot.tree.command(name="eco-pay", description="Pay another user from your balance")
 @app_commands.allowed_installs(guilds=True, users=False)
 async def eco_pay(interaction: discord.Interaction, user: discord.Member, amount: int):
     if amount <= 0:
-        return await interaction.response.send_message("❌ Amount must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Amount must be greater than 0.", ephemeral=True)
     data = load_data()
     guild_id = str(interaction.guild.id)
     sender_data = get_user_data(data, guild_id, str(interaction.user.id))
     receiver_data = get_user_data(data, guild_id, str(user.id))
     if sender_data["balance"] < amount:
-        return await interaction.response.send_message("❌ You don't have enough money!", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money!", ephemeral=True)
     sender_data["balance"] -= amount
     receiver_data["balance"] += amount
     save_data(data)
-    await interaction.response.send_message(f"✅ Successfully sent **${amount}** to {user.mention}!")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Successfully sent **${amount}** to {format_user_reference(user)}!")
 
 
 @bot.tree.command(name="eco-shop", description="View the server shop")
@@ -2562,7 +2865,7 @@ async def eco_shop(interaction: discord.Interaction):
     if not shop_items:
         await interaction.response.send_message("The shop is currently empty!")
         return
-    embed = discord.Embed(title="🛒 Server Shop", color=discord.Color.gold())
+    embed = discord.Embed(title="<:chalice:1517579767573123092> Server Shop", color=discord.Color.gold())
     embed.description = "Click a button below to purchase an item! \n ~~───────────────────────────~~"
     for item, info in shop_items.items():
         embed.add_field(name=f"{item} - ${info['price']}", value=info['desc'], inline=False)
@@ -2578,7 +2881,7 @@ async def eco_shop_add(interaction: discord.Interaction, name: str, desc: str, p
     guild = get_guild_data(data, str(interaction.guild.id))
     guild["shop"][name] = {"desc": desc, "price": price}
     save_data(data)
-    await interaction.response.send_message(f"✅ Added **{name}** to the shop!")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Added **{name}** to the shop!")
 
 
 @bot.tree.command(name="eco-shop-del", description="Remove an item from the shop")
@@ -2591,9 +2894,9 @@ async def eco_shop_del(interaction: discord.Interaction, name: str):
     if canonical:
         del guild["shop"][canonical]
         save_data(data)
-        await interaction.response.send_message(f"✅ Removed **{canonical}** from the shop.")
+        await interaction.response.send_message(f"<:approve:1517452125687513158> Removed **{canonical}** from the shop.")
     else:
-        await interaction.response.send_message(f"❌ **{name}** was not found in the shop.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> **{name}** was not found in the shop.", ephemeral=True)
 
 
 @bot.tree.command(name="eco-inventory", description="Check your inventory (or another user's if owner)")
@@ -2601,12 +2904,12 @@ async def eco_shop_del(interaction: discord.Interaction, name: str):
 @app_commands.describe(user="The user you want to check (Owner only)")
 async def eco_inventory(interaction: discord.Interaction, user: discord.Member = None):
     if user and interaction.user.id != interaction.guild.owner_id:
-        return await interaction.response.send_message("❌ Only the server owner can check others' inventories.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Only the server owner can check others' inventories.", ephemeral=True)
     target = user or interaction.user
     data = load_data()
     user_data = get_user_data(data, str(interaction.guild.id), str(target.id))
     inv = user_data.get("inventory", {})
-    embed = discord.Embed(title=f"📦 {target.display_name}'s Inventory", color=discord.Color.green())
+    embed = discord.Embed(title=f"<:box:1517581439552585759> {target.display_name}'s Inventory", color=discord.Color.green())
     if not inv:
         embed.description = "This inventory is currently empty."
     else:
@@ -2621,7 +2924,7 @@ async def eco_inventory_edit(interaction: discord.Interaction, user: discord.Mem
     item = normalize_item(item)
     action = action.lower().strip()
     if action not in ("add", "remove"):
-        return await interaction.response.send_message("❌ Action must be **add** or **remove**.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Action must be **add** or **remove**.", ephemeral=True)
     data = load_data()
     user_data = get_user_data(data, str(interaction.guild.id), str(user.id))
     if action == "add":
@@ -2631,11 +2934,11 @@ async def eco_inventory_edit(interaction: discord.Interaction, user: discord.Mem
         if removed < amount:
             save_data(data)
             return await interaction.response.send_message(
-                f"⚠️ Only removed **{removed}x {item}** - {user.display_name} didn't have enough.", ephemeral=True
+                f"<:warning:1517452174991556758> Only removed **{removed}x {item}** - {user.display_name} didn't have enough.", ephemeral=True
             )
     save_data(data)
     direction = "to" if action == "add" else "from"
-    await interaction.response.send_message(f"✅ {action.capitalize()}d **{amount}x {item}** {direction} {user.display_name}'s inventory.")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> {action.capitalize()}d **{amount}x {item}** {direction} {user.display_name}'s inventory.")
 
 
 @bot.tree.command(name="eco-balance-edit", description="Set a user's balance (Owner Only)")
@@ -2646,7 +2949,7 @@ async def eco_balance_edit(interaction: discord.Interaction, user: discord.Membe
     user_data = get_user_data(data, str(interaction.guild.id), str(user.id))
     user_data["balance"] = amount
     save_data(data)
-    await interaction.response.send_message(f"✅ Set {user.display_name}'s balance to **${amount}**.")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Set {user.display_name}'s balance to **${amount}**.")
 
 
 
@@ -2662,7 +2965,7 @@ async def eco_balance_edit(interaction: discord.Interaction, user: discord.Membe
 @app_commands.allowed_installs(guilds=True, users=False)
 async def game_slot(interaction: discord.Interaction, amount: int):
     if amount <= 0:
-        return await interaction.response.send_message("❌ Bet amount must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Bet amount must be greater than 0.", ephemeral=True)
 
     data = load_data()
     guild_id = str(interaction.guild.id)
@@ -2670,9 +2973,9 @@ async def game_slot(interaction: discord.Interaction, amount: int):
     before_balance = user_data["balance"]
 
     if before_balance < amount:
-        return await interaction.response.send_message("❌ You don't have enough money to place that bet.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money to place that bet.", ephemeral=True)
 
-    emojis = ['🍒', '🍎', '🍇', '💎', '🔔', '🍋']
+    emojis = ['🍒', '🍎', '🍇', '💎', '<:bell:1517497562184024275>', '🍋']
     e1, e2, e3 = (random.choice(emojis) for _ in range(3))
 
     if e1 == e2 == e3:
@@ -2697,7 +3000,7 @@ async def game_slot(interaction: discord.Interaction, amount: int):
 @app_commands.allowed_installs(guilds=True, users=False)
 async def game_coinflip(interaction: discord.Interaction, amount: int):
     if amount <= 0:
-        return await interaction.response.send_message("❌ Bet amount must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Bet amount must be greater than 0.", ephemeral=True)
 
     data = load_data()
     guild_id = str(interaction.guild.id)
@@ -2705,7 +3008,7 @@ async def game_coinflip(interaction: discord.Interaction, amount: int):
     before_balance = user_data["balance"]
 
     if before_balance < amount:
-        return await interaction.response.send_message("❌ You don't have enough money to place that bet.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money to place that bet.", ephemeral=True)
 
     result = random.choice(["heads", "tails"])
     if result == "heads":
@@ -2735,9 +3038,9 @@ class MinesButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: MinesGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
         view.action_taken = True
         if self.index in view.mine_positions:
             self.style = discord.ButtonStyle.danger
@@ -2778,11 +3081,11 @@ class MinesCashoutButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: MinesGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
         if not view.action_taken:
-            return await interaction.response.send_message("❌ You must reveal at least one tile before cashing out.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> You must reveal at least one tile before cashing out.", ephemeral=True)
 
         payout = view.calculate_payout()
         data = load_data()
@@ -2792,7 +3095,7 @@ class MinesCashoutButton(discord.ui.Button):
         active_minigame_users.discard(view.user_id)
         view.finished = True
         view.disable_all_items()
-        view.embed.title = "💰 Minesweeper - Cash Out"
+        view.embed.title = "<:money:1517580310395486239> Minesweeper - Cash Out"
         view.embed.description = (
             f"You cashed out with **${payout}**.\n"
             f"Safe tiles found: **{len(view.revealed_positions)}/{view.total_safe}**"
@@ -2915,7 +3218,7 @@ class MinesGameView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
             return False
         return True
 
@@ -2943,9 +3246,9 @@ class MinesGameView(discord.ui.View):
 @app_commands.allowed_installs(guilds=True, users=False)
 async def game_mines(interaction: discord.Interaction, amount: int, mines: int):
     if amount <= 0:
-        return await interaction.response.send_message("❌ Bet amount must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Bet amount must be greater than 0.", ephemeral=True)
     if mines < 3 or mines > 10:
-        return await interaction.response.send_message("❌ Number of mines must be between 3 and 10.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Number of mines must be between 3 and 10.", ephemeral=True)
 
     data = load_data()
     guild_id = str(interaction.guild.id)
@@ -2953,10 +3256,10 @@ async def game_mines(interaction: discord.Interaction, amount: int, mines: int):
     before_balance = user_data["balance"]
 
     if interaction.user.id in active_minigame_users:
-        return await interaction.response.send_message("❌ You already have an active minigame. Finish or wait for it to time out before starting another.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You already have an active minigame. Finish or wait for it to time out before starting another.", ephemeral=True)
 
     if before_balance < amount:
-        return await interaction.response.send_message("❌ You don't have enough money to place that bet.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money to place that bet.", ephemeral=True)
 
     user_data["balance"] -= amount
     save_data(data)
@@ -2975,11 +3278,11 @@ class TowerButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: TowersGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
         if self.row_index != view.current_row:
-            return await interaction.response.send_message("❌ You must click a button in the current row first.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> You must click a button in the current row first.", ephemeral=True)
 
         view.action_taken = True
         if self.col_index in view.correct_positions[self.row_index]:
@@ -3018,11 +3321,11 @@ class CashoutButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: TowersGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
         if not view.action_taken:
-            return await interaction.response.send_message("❌ You must pick at least one tile before cashing out.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> You must pick at least one tile before cashing out.", ephemeral=True)
 
         payout = view.calculate_payout(view.rows_cleared())
         data = load_data()
@@ -3033,7 +3336,7 @@ class CashoutButton(discord.ui.Button):
         active_minigame_users.discard(view.user_id)
         view.finished = True
         view.disable_all_items()
-        view.embed.title = "💰 Tower Gamble - Cash Out"
+        view.embed.title = "<:money:1517580310395486239> Tower Gamble - Cash Out"
         view.embed.description = (
             f"You cashed out with **${payout}**.\n"
             f"Rows cleared: {view.rows_cleared()}/5"
@@ -3127,7 +3430,7 @@ class TowersGameView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
             return False
         return True
 
@@ -3157,7 +3460,7 @@ class TowersGameView(discord.ui.View):
 @app_commands.allowed_installs(guilds=True, users=False)
 async def game_towers(interaction: discord.Interaction, amount: int):
     if amount <= 0:
-        return await interaction.response.send_message("❌ Bet amount must be greater than 0.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Bet amount must be greater than 0.", ephemeral=True)
 
     data = load_data()
     guild_id = str(interaction.guild.id)
@@ -3165,10 +3468,10 @@ async def game_towers(interaction: discord.Interaction, amount: int):
     before_balance = user_data["balance"]
 
     if interaction.user.id in active_minigame_users:
-        return await interaction.response.send_message("❌ You already have an active minigame. Finish or wait for it to time out before starting another.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You already have an active minigame. Finish or wait for it to time out before starting another.", ephemeral=True)
 
     if before_balance < amount:
-        return await interaction.response.send_message("❌ You don't have enough money to place that bet.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money to place that bet.", ephemeral=True)
 
     user_data["balance"] -= amount
     save_data(data)
@@ -3186,9 +3489,9 @@ class DeveloperCodeSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: WorkGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
 
         selected_index = int(self.values[0])
         
@@ -3221,9 +3524,9 @@ class DeveloperCodeButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: WorkGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
 
         if self.is_odd:
             view.finished = True
@@ -3258,9 +3561,9 @@ class FarmerCropButton(discord.ui.Button):
     async def callback(self, interaction: discord.Interaction):
         view: WorkGameView = self.view
         if interaction.user.id != view.user_id:
-            return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
         if view.finished:
-            return await interaction.response.send_message("❌ This game has already ended.", ephemeral=True)
+            return await interaction.response.send_message("<:disapprove:1517452151012589662> This game has already ended.", ephemeral=True)
 
         if self.is_dirt:
             self.disabled = True
@@ -3322,7 +3625,7 @@ class WorkGameView(discord.ui.View):
         random.shuffle(code_options)
         
         self.embed.title = "👨‍💻 Developer Job"
-        self.embed.description = f"Find the code string that is different from the others!\n⏱️ **30 seconds left**"
+        self.embed.description = f"Find the code string that is different from the others!\n<:timer:1517996239583576194> **30 seconds left**"
         
         odd_index = code_options.index(odd_code)
         for i, code in enumerate(code_options):
@@ -3343,7 +3646,7 @@ class WorkGameView(discord.ui.View):
         self.embed.description = (
             f"Collect all **{target_crop}** crops from the farm!\n"
             f"Click the right crops and avoid the others.\n"
-            f"⏱️ **30 seconds left**"
+            f"<:timer:1517996239583576194> **30 seconds left**"
         )
 
         for i in range(8):
@@ -3360,7 +3663,7 @@ class WorkGameView(discord.ui.View):
 
     def setup_math_job(self):
         self.embed.title = "🧮 Math Teacher Job"
-        self.embed.description = f"Solve the equation!\n⏱️ **30 seconds left**"
+        self.embed.description = f"Solve the equation!\n<:timer:1517996239583576194> **30 seconds left**"
         
         num1 = random.randint(10, 99)
         num2 = random.randint(1, 50)
@@ -3374,7 +3677,7 @@ class WorkGameView(discord.ui.View):
             self.correct_answer = num1 * num2
         
         self.equation = f"{num1} {operation} {num2} = ?"
-        self.embed.description = f"**{self.equation}**\n⏱️ **30 seconds left**"
+        self.embed.description = f"**{self.equation}**\n<:timer:1517996239583576194> **30 seconds left**"
         
         answer_input = discord.ui.TextInput(
             label="Your Answer",
@@ -3382,7 +3685,7 @@ class WorkGameView(discord.ui.View):
             min_length=1,
             max_length=10,
         )
-        
+    
         class MathAnswerModal(discord.ui.Modal):
             def __init__(self, view: "WorkGameView"):
                 super().__init__(title="Answer")
@@ -3391,9 +3694,9 @@ class WorkGameView(discord.ui.View):
             
             async def on_submit(self, modal_interaction: discord.Interaction):
                 if modal_interaction.user.id != self.view.user_id:
-                    return await modal_interaction.response.send_message("❌ This is not for you.", ephemeral=True)
+                    return await modal_interaction.response.send_message("<:disapprove:1517452151012589662> This is not for you.", ephemeral=True)
                 if self.view.finished:
-                    return await modal_interaction.response.send_message("❌ Game already finished.", ephemeral=True)
+                    return await modal_interaction.response.send_message("<:disapprove:1517452151012589662> Game already finished.", ephemeral=True)
                 
                 try:
                     user_answer = int(answer_input.value)
@@ -3417,13 +3720,13 @@ class WorkGameView(discord.ui.View):
                         await modal_interaction.response.defer()
                         await self.view.message.edit(embed=self.view.embed, view=self.view)
                 except ValueError:
-                    await modal_interaction.response.send_message("❌ Please enter a valid number.", ephemeral=True)
+                    await modal_interaction.response.send_message("<:disapprove:1517452151012589662> Please enter a valid number.", ephemeral=True)
         
         submit_button = discord.ui.Button(label="Submit Answer", style=discord.ButtonStyle.primary)
         
         async def submit_callback(interaction: discord.Interaction):
             if interaction.user.id != self.user_id:
-                return await interaction.response.send_message("❌ This game is not for you.", ephemeral=True)
+                return await interaction.response.send_message("<:disapprove:1517452151012589662> This game is not for you.", ephemeral=True)
             await interaction.response.send_modal(MathAnswerModal(self))
         
         submit_button.callback = submit_callback
@@ -3475,7 +3778,7 @@ async def game_work(interaction: discord.Interaction):
             minutes = int(remaining // 60)
             seconds = int(remaining % 60)
             return await interaction.response.send_message(
-                f"⏱️ You can work again in **{minutes}m {seconds}s**.",
+                f"<:timer:1517996239583576194> You can work again in **{minutes}m {seconds}s**.",
                 ephemeral=True
             )
     
@@ -3514,7 +3817,7 @@ async def eco_craft_add(interaction: discord.Interaction, item: str, req1_name: 
         recipe["reqs"][normalize_item(req2_name)] = req2_count
     guild["recipes"][item] = recipe
     save_data(data)
-    await interaction.response.send_message(f"✅ Added recipe: **{item}** (Time: {delay}s).")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Added recipe: **{item}** (Time: {delay}s).")
 
 
 @bot.tree.command(name="eco-craft", description="Craft an item")
@@ -3525,12 +3828,12 @@ async def eco_craft(interaction: discord.Interaction, item: str, amount: int = 1
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
     canonical_item = find_item_key(guild["recipes"], item)
     if not canonical_item:
-        return await interaction.response.send_message("❌ This item is not craftable.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> This item is not craftable.", ephemeral=True)
     recipe = guild["recipes"][canonical_item]
     delay = recipe.get("delay", 0)
     for req_item, count in recipe["reqs"].items():
         if inventory_count(user_data["inventory"], req_item) < (count * amount):
-            return await interaction.response.send_message(f"❌ You don't have enough **{req_item}**.", ephemeral=True)
+            return await interaction.response.send_message(f"<:disapprove:1517452151012589662> You don't have enough **{req_item}**.", ephemeral=True)
     await interaction.response.send_message(f"🔨 Starting to craft {amount}x **{canonical_item}**... (Wait {delay}s)")
     if delay > 0:
         await asyncio.sleep(delay)
@@ -3539,12 +3842,12 @@ async def eco_craft(interaction: discord.Interaction, item: str, amount: int = 1
         user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
         for req_item, count in recipe["reqs"].items():
             if inventory_count(user_data["inventory"], req_item) < (count * amount):
-                return await interaction.followup.send("❌ Crafting failed: You spent your ingredients while waiting!", ephemeral=True)
+                return await interaction.followup.send("<:disapprove:1517452151012589662> Crafting failed: You spent your ingredients while waiting!", ephemeral=True)
     for req_item, count in recipe["reqs"].items():
         inventory_remove(user_data["inventory"], req_item, count * amount)
     inventory_add(user_data["inventory"], canonical_item, amount)
     save_data(data)
-    await interaction.followup.send(f"✅ Finished crafting {amount}x **{canonical_item}**!")
+    await interaction.followup.send(f"<:approve:1517452125687513158> Finished crafting {amount}x **{canonical_item}**!")
 
 
 @bot.tree.command(name="eco-craft-del", description="Remove a recipe (Owner Only)")
@@ -3557,9 +3860,9 @@ async def eco_craft_del(interaction: discord.Interaction, item: str):
     if canonical:
         del guild["recipes"][canonical]
         save_data(data)
-        await interaction.response.send_message(f"🗑️ Removed recipe for **{canonical}**.")
+        await interaction.response.send_message(f"<:trash:1517497581058527404> Removed recipe for **{canonical}**.")
     else:
-        await interaction.response.send_message(f"❌ No recipe found for **{item}**.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> No recipe found for **{item}**.", ephemeral=True)
 
 
 @bot.tree.command(name="eco-use-add", description="Add usage effect (including giving an item or XP)")
@@ -3586,24 +3889,24 @@ async def eco_use_add(interaction: discord.Interaction, item: str, money: int = 
     if role:
         if interaction.user.top_role <= role:
             return await interaction.response.send_message(
-                "❌ You cannot configure an item to grant a role that is equal or higher than your highest role.",
+                "<:disapprove:1517452151012589662> You cannot configure an item to grant a role that is equal or higher than your highest role.",
                 ephemeral=True
             )
         if interaction.guild.me.top_role <= role:
             return await interaction.response.send_message(
-                "❌ I cannot assign that role because it is equal or higher than my highest role.",
+                "<:disapprove:1517452151012589662> I cannot assign that role because it is equal or higher than my highest role.",
                 ephemeral=True
             )
 
     if temp_role:
         if interaction.user.top_role <= temp_role:
             return await interaction.response.send_message(
-                "❌ You cannot configure an item to grant a temporary role that is equal or higher than your highest role.",
+                "<:disapprove:1517452151012589662> You cannot configure an item to grant a temporary role that is equal or higher than your highest role.",
                 ephemeral=True
             )
         if interaction.guild.me.top_role <= temp_role:
             return await interaction.response.send_message(
-                "❌ I cannot assign that temporary role because it is equal or higher than my highest role.",
+                "<:disapprove:1517452151012589662> I cannot assign that temporary role because it is equal or higher than my highest role.",
                 ephemeral=True
             )
 
@@ -3623,7 +3926,7 @@ async def eco_use_add(interaction: discord.Interaction, item: str, money: int = 
     }
     save_data(data)
     await interaction.response.send_message(
-        f"✅ Effect registered for **{item}**. (Gives: {give_item_amount}x {give_item if give_item else 'None'})"
+        f"<:approve:1517452125687513158> Effect registered for **{item}**. (Gives: {give_item_amount}x {give_item if give_item else 'None'})"
     )
 
 
@@ -3634,13 +3937,13 @@ async def eco_use(interaction: discord.Interaction, item: str, number_of_times: 
     guild = get_guild_data(data, str(interaction.guild.id))
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
     if inventory_count(user_data["inventory"], item) < number_of_times:
-        return await interaction.response.send_message(f"❌ You need **{number_of_times}x** of this item to do that.", ephemeral=True)
+        return await interaction.response.send_message(f"<:disapprove:1517452151012589662> You need **{number_of_times}x** of this item to do that.", ephemeral=True)
     canonical_item = find_item_key(guild["item_uses"], item)
     if not canonical_item:
-        return await interaction.response.send_message("❌ This item has no special use effect.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> This item has no special use effect.", ephemeral=True)
     effect = guild["item_uses"][canonical_item]
     if number_of_times > 1 and (effect.get("role_id") or effect.get("temp_role_id")):
-        return await interaction.response.send_message("❌ You cannot use role-giving items multiple times at once.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You cannot use role-giving items multiple times at once.", ephemeral=True)
     if effect.get("instant_message"):
         await interaction.response.send_message(effect["instant_message"])
     else:
@@ -3665,24 +3968,28 @@ async def eco_use(interaction: discord.Interaction, item: str, number_of_times: 
                 if role and interaction.guild.me.top_role > role:
                     try:
                         await interaction.user.add_roles(role)
-                    except discord.Forbidden:
-                        pass
+                    except discord.Forbidden as error:
+                        add_bot_error_entry(interaction.guild.id, interaction.channel_id, interaction.user, "item use role grant", error)
             if effect.get("temp_role_id"):
                 role = interaction.guild.get_role(effect["temp_role_id"])
                 if role and interaction.guild.me.top_role > role:
                     try:
                         await interaction.user.add_roles(role)
-                    except discord.Forbidden:
+                    except discord.Forbidden as error:
+                        add_bot_error_entry(interaction.guild.id, interaction.channel_id, interaction.user, "item use temp role grant", error)
                         continue
                     async def remove_role(r):
-                        await asyncio.sleep(effect["duration"])
-                        await interaction.user.remove_roles(r)
+                            await asyncio.sleep(effect["duration"])
+                            try:
+                                await interaction.user.remove_roles(r)
+                            except discord.Forbidden as error:
+                                add_bot_error_entry(interaction.guild.id, interaction.channel_id, interaction.user, "item use temp role remove", error)
                     bot.loop.create_task(remove_role(role))
     user_data["balance"] += total_money
     save_data(data)
     if total_xp > 0:
-        await add_xp(interaction.user, interaction.guild, total_xp)
-    final_msg = f"✨ [{number_of_times}x] {effect['message']}"
+        await add_xp(interaction.user, interaction.guild, total_xp, announce_channel=interaction.channel)
+    final_msg = f"<:spark:1517583248421552305> [{number_of_times}x] {effect['message']}"
     if total_money > 0:
         final_msg += f" (Reward: ${total_money})"
     if total_xp > 0:
@@ -3705,9 +4012,9 @@ async def eco_use_del(interaction: discord.Interaction, item: str):
     if canonical:
         del guild["item_uses"][canonical]
         save_data(data)
-        await interaction.response.send_message(f"🗑️ Removed usage effect for **{canonical}**.")
+        await interaction.response.send_message(f"<:trash:1517497581058527404> Removed usage effect for **{canonical}**.")
     else:
-        await interaction.response.send_message(f"❌ No usage effect found for **{item}**.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> No usage effect found for **{item}**.", ephemeral=True)
 
 
 @bot.tree.command(name="eco-value-set", description="Set the selling price for an item")
@@ -3719,7 +4026,7 @@ async def eco_value_set(interaction: discord.Interaction, item: str, value: int)
     guild = get_guild_data(data, str(interaction.guild.id))
     guild["item_values"][item] = value
     save_data(data)
-    await interaction.response.send_message(f"✅ Users can now sell **{item}** for **${value}**.")
+    await interaction.response.send_message(f"<:approve:1517452125687513158> Users can now sell **{item}** for **${value}**.")
 
 
 @bot.tree.command(name="eco-value-del", description="Remove the selling price for an item")
@@ -3732,34 +4039,34 @@ async def eco_value_del(interaction: discord.Interaction, item: str):
     if canonical:
         del guild["item_values"][canonical]
         save_data(data)
-        await interaction.response.send_message(f"✅ Removed selling price for **{canonical}**. It can no longer be sold.")
+        await interaction.response.send_message(f"<:approve:1517452125687513158> Removed selling price for **{canonical}**. It can no longer be sold.")
     else:
-        await interaction.response.send_message(f"❌ **{item}** doesn't have a price set.", ephemeral=True)
+        await interaction.response.send_message(f"<:disapprove:1517452151012589662> **{item}** doesn't have a price set.", ephemeral=True)
 
 
 @bot.tree.command(name="eco-sell", description="Sell a specific amount of an item from your inventory")
 @app_commands.allowed_installs(guilds=True, users=False)
 async def eco_sell(interaction: discord.Interaction, item: str, amount: int = 1):
     if amount <= 0:
-        return await interaction.response.send_message("❌ You must sell at least 1 item.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You must sell at least 1 item.", ephemeral=True)
     data = load_data()
     guild = get_guild_data(data, str(interaction.guild.id))
     user_data = get_user_data(data, str(interaction.guild.id), str(interaction.user.id))
     canonical_item = find_item_key(guild.get("item_values", {}), item)
     if canonical_item is None:
-        return await interaction.response.send_message(f"❌ **{item}** cannot be sold. No price has been set for it.", ephemeral=True)
+        return await interaction.response.send_message(f"<:disapprove:1517452151012589662> **{item}** cannot be sold. No price has been set for it.", ephemeral=True)
     item_price = guild["item_values"][canonical_item]
     user_count = inventory_count(user_data["inventory"], canonical_item)
     if user_count < amount:
         return await interaction.response.send_message(
-            f"❌ You don't have enough! You have **{user_count}x {canonical_item}**, but tried to sell **{amount}x**.", ephemeral=True
+            f"<:disapprove:1517452151012589662> You don't have enough! You have **{user_count}x {canonical_item}**, but tried to sell **{amount}x**.", ephemeral=True
         )
     inventory_remove(user_data["inventory"], canonical_item, amount)
     total_value = item_price * amount
     user_data["balance"] += total_value
     save_data(data)
     await interaction.response.send_message(
-        f"💰 You sold **{amount}x {canonical_item}** for a total of **${total_value}**!\n"
+        f"<:money:1517580310395486239> You sold **{amount}x {canonical_item}** for a total of **${total_value}**!\n"
         f"Your new balance is **${user_data['balance']}**."
     )
 
@@ -3771,9 +4078,9 @@ async def info_values(interaction: discord.Interaction):
     guild = get_guild_data(data, str(interaction.guild.id))
     prices = guild.get("item_values", {})
     if not prices:
-        return await interaction.response.send_message("❌ No items have a selling price set yet.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> No items have a selling price set yet.", ephemeral=True)
 
-    embed = discord.Embed(title="💰 Item Market Prices", color=discord.Color.gold())
+    embed = discord.Embed(title="<:money:1517580310395486239> Item Market Prices", color=discord.Color.gold())
     for item, price in prices.items():
         embed.add_field(name=item, value=f"Sell Price: **${price}**", inline=False)
     await interaction.response.send_message(embed=embed)
@@ -3786,12 +4093,12 @@ async def info_recipes(interaction: discord.Interaction):
     guild = get_guild_data(data, str(interaction.guild.id))
     recipes = guild.get("recipes", {})
     if not recipes:
-        return await interaction.response.send_message("❌ No crafting recipes found.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> No crafting recipes found.", ephemeral=True)
 
     embed = discord.Embed(title="⚒️ Crafting Book", color=discord.Color.blue())
     for result_item, recipe in recipes.items():
         ing_list = ", ".join(f"{amt}x {name}" for name, amt in recipe["reqs"].items())
-        delay_str = f"⏱️ {recipe.get('delay', 0)}s" if recipe.get("delay", 0) > 0 else ""
+        delay_str = f"<:timer:1517996239583576194> {recipe.get('delay', 0)}s" if recipe.get("delay", 0) > 0 else ""
         embed.add_field(name=result_item, value=f"Requires: {ing_list}{(' \n' + delay_str) if delay_str else ''}", inline=False)
     await interaction.response.send_message(embed=embed)
 
@@ -3803,21 +4110,21 @@ async def info_uses(interaction: discord.Interaction):
     guild = get_guild_data(data, str(interaction.guild.id))
     uses = guild.get("item_uses", {})
     if not uses:
-        return await interaction.response.send_message("❌ No item effects have been set up.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> No item effects have been set up.", ephemeral=True)
 
-    embed = discord.Embed(title="🧪 Item Effects Directory", color=discord.Color.green())
+    embed = discord.Embed(title="<:Vial:1517681553377857628> Item Effects Directory", color=discord.Color.green())
     for item, effect in uses.items():
         details = []
         money = effect.get("money", 0)
         if money > 0:
-            details.append(f"💰 Gives Money: **${money}**")
+            details.append(f"<:money:1517580310395486239> Gives Money: **${money}**")
         xp_amount = effect.get("xp", 0)
         if xp_amount > 0:
-            details.append(f"🧪 Grants XP: **{xp_amount} XP**")
+            details.append(f"<:Vial:1517681553377857628> Grants XP: **{xp_amount} XP**")
         give_item = effect.get("give_item")
         if give_item:
             amt = effect.get("give_item_amount", 1)
-            details.append(f"📦 Gives: **{amt}x {give_item}**")
+            details.append(f"<:box:1517581439552585759> Gives: **{amt}x {give_item}**")
         if effect.get("role_id"):
             role = interaction.guild.get_role(effect["role_id"])
             if role:
@@ -3826,10 +4133,10 @@ async def info_uses(interaction: discord.Interaction):
             role = interaction.guild.get_role(effect["temp_role_id"])
             dur = effect.get("duration", 0)
             if role:
-                details.append(f"⏳ Temp Role: **{role.name}** ({dur}s)")
+                details.append(f"<:hourglass:1517574046252924938> Temp Role: **{role.name}** ({dur}s)")
         delay = effect.get("delay", 0)
         if delay > 0:
-            details.append(f"⏱️ Delay: {delay}s")
+            details.append(f"<:timer:1517996239583576194> Delay: {delay}s")
         msg = effect.get("message")
         if msg and msg != "Used item!":
             details.append(f"💬 Message: *{msg}*")
@@ -3837,7 +4144,7 @@ async def info_uses(interaction: discord.Interaction):
             embed.add_field(name=item, value="\n".join(details), inline=False)
 
     if not embed.fields:
-        return await interaction.response.send_message("❌ No item effects have been set up.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> No item effects have been set up.", ephemeral=True)
 
     await interaction.response.send_message(embed=embed)
 
@@ -3851,7 +4158,7 @@ async def info_uses(interaction: discord.Interaction):
 
 
 
-async def add_xp(member: discord.Member, guild: discord.Guild, xp_to_add: int):
+async def add_xp(member: discord.Member, guild: discord.Guild, xp_to_add: int, announce_channel=None):
     if member.bot:
         return
         
@@ -3898,24 +4205,39 @@ async def add_xp(member: discord.Member, guild: discord.Guild, xp_to_add: int):
                 if role and role not in member.roles:
                     try:
                         await member.add_roles(role)
-                    except discord.Forbidden:
-                        print(f"Missing permissions to add role reward {role.name}")
+                    except discord.Forbidden as error:
+                        add_bot_error_entry(guild.id, None, member, f"level reward role: {role.name}", error)
 
             if reward.get("temp_role_id"):
                 role = guild.get_role(int(reward["temp_role_id"]))
                 if role and role not in member.roles:
                     try:
                         await member.add_roles(role)
-                    except discord.Forbidden:
+                    except discord.Forbidden as error:
+                        add_bot_error_entry(guild.id, None, member, f"level temp role: {role.name}", error)
                         role = None
                 if role and reward.get("duration", 0) > 0:
                     async def remove_temp_role(r):
                         await asyncio.sleep(reward.get("duration", 0))
-                        await member.remove_roles(r)
+                        try:
+                            await member.remove_roles(r)
+                        except discord.Forbidden as error:
+                            add_bot_error_entry(guild.id, None, member, f"level temp role remove: {r.name}", error)
                     bot.loop.create_task(remove_temp_role(role))
 
             if reward.get("xp", 0) > 0:
-                await add_xp(member, guild, reward["xp"])
+                await add_xp(member, guild, reward["xp"], announce_channel=announce_channel)
+
+        guild_config = levels[guild_id]["config"]
+        if guild_config.get("level_up_message_enabled", False) and announce_channel is not None:
+            try:
+                await announce_channel.send(
+                    f"{format_user_reference(member)} just reached **Level {current_level}**!"
+                )
+            except discord.Forbidden as error:
+                add_bot_error_entry(guild.id, announce_channel.id, member, "level up message", error)
+            except Exception:
+                pass
 
         channel_id = levels[guild_id]["config"].get("channel_id")
         target_channel = guild.get_channel(int(channel_id)) if channel_id else None
@@ -3924,10 +4246,13 @@ async def add_xp(member: discord.Member, guild: discord.Guild, xp_to_add: int):
             card_bytes = await create_levelup_card(member, current_level)
             if card_bytes:
                 file = discord.File(fp=card_bytes, filename="levelup.png")
-                await target_channel.send(
-                    content=f"🎉 {member.mention}, you just reached **Level {current_level}**!",
-                    file=file
-                )
+                try:
+                    await target_channel.send(
+                        content=f"{format_user_reference(member)}, you just reached **Level {current_level}**!",
+                        file=file
+                    )
+                except discord.Forbidden as error:
+                    add_bot_error_entry(guild.id, target_channel.id, member, "level banner", error)
 
 
 async def create_levelup_card(member: discord.Member, level: int):
@@ -3954,7 +4279,7 @@ async def create_levelup_card(member: discord.Member, level: int):
     except Exception:
         font = ImageFont.load_default()
         
-    draw.text((center_x, 190), f"{member.display_name} you are now Level {level}!", fill="white", font=font, anchor="mm")
+    draw.text((center_x, 190), f"{format_banner_username(get_banner_name(member))} you are now Level {level}!", fill="white", font=font, anchor="mm")
     
     buffer = io.BytesIO()
     background.save(buffer, format="PNG")
@@ -3973,25 +4298,9 @@ async def voice_xp_tracker():
                     await add_xp(member, guild, random.randint(5, 10))
 
 COLOR_EMOJIS = {
-    "white": "⬜", "black": "⬛", "red": "🟥", "blue": "🟦", 
-    "green": "🟩", "yellow": "🟨", "purple": "🟪", "orange": "🟧", "brown": "🟫"
+    "white": "<:Square_White:1517679898414813427>", "black": "<:Square_Black:1517679889615032540>", "red": "<:Square_Red:1517679897068306522>", "blue": "<:Square_Blue:1517679890932043897>", 
+    "green": "<:Square_Green:1517679893234716843>", "yellow": "<:Square_Yellow:1517679899769311302>", "purple": "<:Square_Purple:1517679895738581062>", "orange": "<:Square_Orange:1517679894526562405>", "brown": "<:Square_Brown:1517679892039204955>"
 }
-
-
-@bot.tree.command(name="color", description="Choose the block color for your /level tracking progress bar")
-@app_commands.allowed_installs(guilds=True, users=False)
-@app_commands.choices(color=[app_commands.Choice(name=name.title(), value=name) for name in COLOR_EMOJIS.keys() if name != "black"])
-async def set_profile_color(interaction: discord.Interaction, color: str):
-    settings = load_user_settings()
-    if "users" not in settings:
-        settings["users"] = {}
-    settings["users"][str(interaction.user.id)] = {"color": color}
-    save_user_settings(settings)
-
-    await interaction.response.send_message(
-        f"🎨 Clean style! Your profile tracking bar is now set to {COLOR_EMOJIS[color]} **{color}** across all servers.",
-        ephemeral=True
-    )
 
 
 @bot.tree.command(name="level", description="View your current server tier standing level rank card")
@@ -4013,18 +4322,18 @@ async def view_level(interaction: discord.Interaction, user: discord.Member = No
     filled_blocks = min(max(int(ratio * 10), 0), 10)
     empty_blocks = 10 - filled_blocks
     
-    filled_emoji = COLOR_EMOJIS.get(chosen_color, "⬜")
-    empty_emoji = COLOR_EMOJIS.get("black", "⬛")
+    filled_emoji = COLOR_EMOJIS.get(chosen_color, "<:Square_White:1517679898414813427>")
+    empty_emoji = COLOR_EMOJIS.get("black", "<:Square_Black:1517679889615032540>")
     
     progress_bar = (filled_emoji * filled_blocks) + (empty_emoji * empty_blocks)
     
     embed = discord.Embed(
-        title=f"🏆 Rank Profile - {target.display_name}",
+        title=f"<:chalice:1517579767573123092> Rank Profile - {target.display_name}",
         color=discord.Color.dark_gray()
     )
     embed.set_thumbnail(url=target.display_avatar.url)
-    embed.add_field(name="Current Tier", value=f"✨ **Level {current_lvl}**", inline=True)
-    embed.add_field(name="Experience Nodes", value=f"🧪 `{current_xp:,}` / `{xp_needed:,}` XP", inline=True)
+    embed.add_field(name="Current Tier", value=f"<:spark:1517583248421552305> **Level {current_lvl}**", inline=True)
+    embed.add_field(name="Experience Nodes", value=f"<:Vial:1517681553377857628> `{current_xp:,}` / `{xp_needed:,}` XP", inline=True)
     embed.add_field(name="Progress Metrics", value=progress_bar, inline=False)
     
     await interaction.response.send_message(embed=embed)
@@ -4042,7 +4351,7 @@ async def level_leaderboard(interaction: discord.Interaction):
         
     sorted_users = sorted(users_dict.items(), key=lambda x: (x[1]["level"], x[1]["xp"]), reverse=True)
     
-    embed = discord.Embed(title=f"📊 Level Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
+    embed = discord.Embed(title=f"<:graph:1517584522877866065> Level Standings Leaderboard - {interaction.guild.name}", color=discord.Color.gold())
     
     description_text = ""
     for index, (u_id, data) in enumerate(sorted_users[:10], start=1):
@@ -4069,7 +4378,7 @@ async def lvl_edit(interaction: discord.Interaction, user: discord.Member, level
         "color": levels[g_id]["users"].get(u_id, {}).get("color", "white")
     }
     save_levels(levels)
-    await interaction.response.send_message(f"⚙️ Action complete. Set {user.mention} to **Level {level}** with **{xp} XP**.", ephemeral=True)
+    await interaction.response.send_message(f"<:gear:1517576939097952496> Action complete. Set {format_user_reference(user)} to **Level {level}** with **{xp} XP**.", ephemeral=True)
 
 
 @bot.tree.command(name="lvl-channel-set", description="(Admin) Route level-up image logs into a designated text stream")
@@ -4083,7 +4392,7 @@ async def lvl_channel_set(interaction: discord.Interaction, channel: discord.Tex
     
     levels[g_id]["config"]["channel_id"] = channel.id
     save_levels(levels)
-    await interaction.response.send_message(f"📌 Destination updated! Level-up notifications will now send to {channel.mention}.")
+    await interaction.response.send_message(f"<:bell:1517497562184024275> Destination updated! Level-up notifications will now send to {channel.mention}.")
 
 
 @bot.tree.command(name="lvl-channel-remove", description="(Admin) Disable level-up notification image cards from sending")
@@ -4095,7 +4404,7 @@ async def lvl_channel_remove(interaction: discord.Interaction):
     
     if g_id not in levels or "config" not in levels[g_id] or levels[g_id]["config"].get("channel_id") is None:
         return await interaction.response.send_message(
-            "❌ There is no level-up notification channel configured for this server currently.", 
+            "<:disapprove:1517452151012589662> There is no level-up notification channel configured for this server currently.", 
             ephemeral=True
         )
     
@@ -4103,7 +4412,31 @@ async def lvl_channel_remove(interaction: discord.Interaction):
     save_levels(levels)
     
     await interaction.response.send_message(
-        "🗑️ Configuration removed! Level-up image banners are now disabled for this server.", 
+        "<:trash:1517497581058527404> Configuration removed! Level-up image banners are now disabled for this server.", 
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="toggle-lvl-up-message", description="(Admin) Enable or disable level-up chat messages")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.checks.has_permissions(manage_guild=True)
+async def toggle_lvl_up_message(interaction: discord.Interaction):
+    levels = load_levels()
+    g_id = str(interaction.guild_id)
+
+    if g_id not in levels:
+        levels[g_id] = {"config": {"channel_id": None, "rewards": {}, "level_up_message_enabled": False}, "users": {}}
+    elif "config" not in levels[g_id]:
+        levels[g_id]["config"] = {"channel_id": None, "rewards": {}, "level_up_message_enabled": False}
+
+    current_state = levels[g_id]["config"].get("level_up_message_enabled", False)
+    new_state = not current_state
+    levels[g_id]["config"]["level_up_message_enabled"] = new_state
+    save_levels(levels)
+
+    status_text = "enabled" if new_state else "disabled"
+    await interaction.response.send_message(
+        f"📢 Level-up chat messages are now **{status_text}** for this server.",
         ephemeral=True
     )
 
@@ -4124,31 +4457,31 @@ async def lvl_channel_remove(interaction: discord.Interaction):
 async def lvl_rewards_set(interaction: discord.Interaction, level: int, role: discord.Role = None, temp_role: discord.Role = None, duration: int = 0, money: int = 0, xp: int = 0, item: str = None, item_amount: int = 1):
     if not role and not temp_role and money <= 0 and xp <= 0 and not item:
         return await interaction.response.send_message(
-            "❌ You must specify at least one reward: role, temp_role, money, xp, or item.",
+            "<:disapprove:1517452151012589662> You must specify at least one reward: role, temp_role, money, xp, or item.",
             ephemeral=True
         )
 
     if role:
         if interaction.user.top_role <= role:
             return await interaction.response.send_message(
-                "❌ You cannot configure a level reward role that is equal or higher than your highest role.",
+                "<:disapprove:1517452151012589662> You cannot configure a level reward role that is equal or higher than your highest role.",
                 ephemeral=True
             )
         if interaction.guild.me.top_role <= role:
             return await interaction.response.send_message(
-                "❌ I cannot assign that role because it is equal or higher than my highest role.",
+                "<:disapprove:1517452151012589662> I cannot assign that role because it is equal or higher than my highest role.",
                 ephemeral=True
             )
 
     if temp_role:
         if interaction.user.top_role <= temp_role:
             return await interaction.response.send_message(
-                "❌ You cannot configure a temporary role reward that is equal or higher than your highest role.",
+                "<:disapprove:1517452151012589662> You cannot configure a temporary role reward that is equal or higher than your highest role.",
                 ephemeral=True
             )
         if interaction.guild.me.top_role <= temp_role:
             return await interaction.response.send_message(
-                "❌ I cannot assign that temporary role because it is equal or higher than my highest role.",
+                "<:disapprove:1517452151012589662> I cannot assign that temporary role because it is equal or higher than my highest role.",
                 ephemeral=True
             )
 
@@ -4186,7 +4519,7 @@ async def lvl_rewards_set(interaction: discord.Interaction, level: int, role: di
         reward_parts.append(f"{item_amount}x {normalize_item(item)}")
 
     await interaction.response.send_message(
-        f"🎁 Level {level} reward configured: {', '.join(reward_parts)}.", ephemeral=True
+        f"<:box:1517581439552585759> Level {level} reward configured: {', '.join(reward_parts)}.", ephemeral=True
     )
 
 
@@ -4236,14 +4569,14 @@ async def info_lvl_rewards(interaction: discord.Interaction, level: int = None):
         return await interaction.response.send_message("📭 No level rewards are configured for this server yet.", ephemeral=True)
 
     embed = discord.Embed(
-        title=f"🎁 Level Rewards - {interaction.guild.name}",
+        title=f"<:box:1517581439552585759> Level Rewards - {interaction.guild.name}",
         color=discord.Color.gold()
     )
 
     if level is not None:
         reward_data = rewards.get(str(level))
         if not reward_data:
-            return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+            return await interaction.response.send_message(f"<:disapprove:1517452151012589662> No rewards are configured for level {level} in this server.", ephemeral=True)
 
         embed.description = format_level_reward_summary(interaction.guild, str(level), reward_data)
     else:
@@ -4265,16 +4598,16 @@ async def lvl_rewards_del(interaction: discord.Interaction, level: int):
     g_id = str(interaction.guild_id)
 
     if g_id not in levels or "config" not in levels[g_id] or "rewards" not in levels[g_id]["config"]:
-        return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+        return await interaction.response.send_message(f"<:disapprove:1517452151012589662> No rewards are configured for level {level} in this server.", ephemeral=True)
 
     rewards = levels[g_id]["config"]["rewards"]
     if str(level) not in rewards:
-        return await interaction.response.send_message(f"❌ No rewards are configured for level {level} in this server.", ephemeral=True)
+        return await interaction.response.send_message(f"<:disapprove:1517452151012589662> No rewards are configured for level {level} in this server.", ephemeral=True)
 
     del rewards[str(level)]
     save_levels(levels)
 
-    await interaction.response.send_message(f"🗑️ Removed all rewards configured for level {level}.", ephemeral=True)
+    await interaction.response.send_message(f"<:trash:1517497581058527404> Removed all rewards configured for level {level}.", ephemeral=True)
 
 
 
@@ -4297,7 +4630,7 @@ async def own_shutdown(
     reason: str = "No reason provided"
 ):
     if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ Do not even try...", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Do not even try...", ephemeral=True)
 
     target_channel = channel or bot.get_channel(1514173159052415026)
     if target_channel is None and isinstance(interaction.channel, discord.TextChannel):
@@ -4322,9 +4655,16 @@ async def own_shutdown(
                     published = True
                 except Exception:
                     published = False
+        except discord.Forbidden as error:
+            add_bot_error_entry(interaction.guild.id if interaction.guild else None, target_channel.id, interaction.user, "shutdown notice", error)
+            await interaction.response.send_message(
+                f"<:disapprove:1517452151012589662> Could not send the shutdown notice to {target_channel.mention}.",
+                ephemeral=True
+            )
+            return
         except Exception as e:
             await interaction.response.send_message(
-                f"❌ Could not send the shutdown notice to {target_channel.mention}. Error: {e}",
+                f"<:disapprove:1517452151012589662> Could not send the shutdown notice to {target_channel.mention}. Error: {e}",
                 ephemeral=True
             )
             return
@@ -4349,6 +4689,7 @@ async def own_shutdown(
     await asyncio.sleep(10)
     for shard_id in bot.shards:
         await bot.change_presence(activity=sleep_activity, status=discord.Status.idle, shard_id=shard_id)
+    close_local_rpc()
     await bot.close()
 
 
@@ -4356,13 +4697,13 @@ async def own_shutdown(
 @app_commands.describe(channel="Optional announcement channel to send the force shutdown message to")
 async def own_stop_urgent(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ Stop.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Stop.", ephemeral=True)
 
     target_channel = channel or bot.get_channel(1514173159052415026)
     if target_channel is None and isinstance(interaction.channel, discord.TextChannel):
         target_channel = interaction.channel
 
-    force_text = "⚠️ The bot is going offline immediately due to an urgent issue."
+    force_text = "<:warning:1517452174991556758> The bot is going offline immediately due to an urgent issue."
     force_embed = discord.Embed(
         title="Force Shutdown",
         description=force_text,
@@ -4377,6 +4718,8 @@ async def own_stop_urgent(interaction: discord.Interaction, channel: discord.Tex
                     await sent_msg.publish()
                 except Exception:
                     pass
+        except discord.Forbidden as error:
+            add_bot_error_entry(interaction.guild.id if interaction.guild else None, target_channel.id, interaction.user, "urgent shutdown notice", error)
         except Exception:
             pass
 
@@ -4386,6 +4729,7 @@ async def own_stop_urgent(interaction: discord.Interaction, channel: discord.Tex
     forced_activity = discord.Activity(type=discord.ActivityType.watching, name="App was shutdown forcefully...")
     for shard_id in bot.shards:
         await bot.change_presence(activity=forced_activity, status=discord.Status.dnd, shard_id=shard_id)
+    close_local_rpc()
     await bot.close()
 
 
@@ -4393,10 +4737,10 @@ async def own_stop_urgent(interaction: discord.Interaction, channel: discord.Tex
 @app_commands.allowed_installs(guilds=True, users=False)
 async def shard_info(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ Owner only.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Owner only.", ephemeral=True)
 
     total_shards = len(bot.shards) or 1
-    embed = discord.Embed(title="🔀 Shard Information", color=discord.Color.blurple())
+    embed = discord.Embed(title="Shard Information", color=discord.Color.blurple())
     embed.add_field(name="Total Shards", value=str(total_shards), inline=True)
     embed.add_field(name="Total Guilds", value=str(len(bot.guilds)), inline=True)
     embed.add_field(name="Total Users", value=str(len(bot.users)), inline=True)
@@ -4406,7 +4750,7 @@ async def shard_info(interaction: discord.Interaction):
         latency_ms = round(shard.latency * 1000, 1)
         embed.add_field(
             name=f"Shard {shard_id}",
-            value=f"📶 {latency_ms}ms | 🏠 {len(guilds_on_shard)} guild(s)",
+            value=f"{latency_ms}ms | {len(guilds_on_shard)} guild(s)",
             inline=False,
         )
 
@@ -4416,7 +4760,7 @@ async def shard_info(interaction: discord.Interaction):
 @bot.tree.command(name="own-shard-map", description="(owner) Show which guilds are assigned to each shard")
 async def shard_map(interaction: discord.Interaction):
     if not await bot.is_owner(interaction.user):
-        return await interaction.response.send_message("❌ You are not authorized to use this command.", ephemeral=True)
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> You are not authorized to use this command.", ephemeral=True)
 
     shard_map = {}
     for guild in bot.guilds:
@@ -4424,7 +4768,7 @@ async def shard_map(interaction: discord.Interaction):
         shard_map.setdefault(shard_id, []).append(f"> **{guild.name}** ||({guild.id})||")
 
     embed = discord.Embed(
-        title="🧩 Shard Assignment Map",
+        title="Shard Assignment Map",
         description="Shows which servers are served by each shard.",
         color=discord.Color.blurple()
     )
@@ -4434,6 +4778,142 @@ async def shard_map(interaction: discord.Interaction):
         embed.add_field(name=f"Shard {shard_id}", value=value, inline=False)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def build_bot_emoji_pages(emojis):
+    pages = []
+    current_lines = []
+
+    def flush_page():
+        if current_lines:
+            pages.append("\n".join(current_lines))
+
+    current_length = 0
+    for emoji in emojis:
+        emoji_line = f"{str(emoji)} `:{emoji.name}:` (`{emoji.id}`){' animated' if emoji.animated else ''}"
+
+        addition = len(emoji_line) + 1
+        if current_lines and current_length + addition > 3200:
+            flush_page()
+            current_lines.clear()
+            current_length = 0
+
+        current_lines.append(emoji_line)
+        current_length += addition
+
+    flush_page()
+    return pages or ["No custom emojis available."]
+
+
+class BotEmojiPaginator(discord.ui.View):
+    def __init__(self, pages):
+        super().__init__(timeout=120)
+        self.pages = pages
+        self.index = 0
+        self.message = None
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.prev_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    def build_embed(self):
+        embed = discord.Embed(
+            title="Bot Emojis",
+            description=self.pages[self.index],
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text=f"Page {self.index + 1}/{len(self.pages)}")
+        return embed
+
+    async def show_page(self, interaction: discord.Interaction):
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Previous", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index > 0:
+            self.index -= 1
+        await self.show_page(interaction)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+        await self.show_page(interaction)
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
+
+
+@bot.tree.command(name="own-bot-emojis", description="(owner) Display all custom emojis the bot can use")
+@app_commands.allowed_installs(guilds=True, users=False)
+async def own_bot_emojis(interaction: discord.Interaction):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Owner only.", ephemeral=True)
+
+    try:
+        emojis = await bot.fetch_application_emojis()
+    except discord.MissingApplicationID:
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> The bot does not have an application ID yet.", ephemeral=True)
+    except Exception as e:
+        return await interaction.response.send_message(f"<:disapprove:1517452151012589662> Could not fetch application emojis: {e}", ephemeral=True)
+
+    emojis = sorted(emojis, key=lambda emoji: emoji.name.lower())
+    if not emojis:
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> The application does not have any custom emojis.", ephemeral=True)
+
+    pages = build_bot_emoji_pages(emojis)
+    view = BotEmojiPaginator(pages)
+    await interaction.response.send_message(embed=view.build_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
+
+
+# -------------------------------------------------------------------------------------------------------------
+#                                               Personalization Commands
+# -------------------------------------------------------------------------------------------------------------
+
+
+
+
+@bot.tree.command(name="set-color", description="Choose the block color for your /level tracking progress bar")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.choices(color=[app_commands.Choice(name=name.title(), value=name) for name in COLOR_EMOJIS.keys() if name != "black"])
+async def set_profile_color(interaction: discord.Interaction, color: str):
+    settings = load_user_settings()
+    user_settings = get_user_settings_entry(settings, str(interaction.user.id))
+    user_settings["color"] = color
+    save_user_settings(settings)
+
+    await interaction.response.send_message(
+        f"<:image:1517497571470348539> Clean style! Your profile tracking bar is now set to {COLOR_EMOJIS[color]} **{color}** across all servers.",
+        ephemeral=True
+    )
+
+
+@bot.tree.command(name="set-getping", description="Toggle whether the bot pings you when it references you")
+@app_commands.allowed_installs(guilds=True, users=False)
+async def set_getping(interaction: discord.Interaction):
+    settings = load_user_settings()
+    user_settings = get_user_settings_entry(settings, str(interaction.user.id))
+    current_state = user_settings.get("user_pings", True)
+    new_state = not current_state
+    user_settings["user_pings"] = new_state
+    save_user_settings(settings)
+
+    status_text = "enabled" if new_state else "disabled"
+    await interaction.response.send_message(
+        f"<:bell:1517497562184024275> User pings are now **{status_text}** for you.",
+        ephemeral=True
+    )
 
 
 
