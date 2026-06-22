@@ -35,6 +35,7 @@ from pypresence.types import ActivityType
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
 VERSION = os.getenv('BOT_VERSION')
+VERSION_ALTERNATE = os.getenv('BOT_VERSION_ALTERNATE')
 RPC_CLIENT_ID = os.getenv('DISCORD_RPC_CLIENT_ID', '').strip()
 raw_blacklist = os.getenv('SERVER_BLACKLIST', '')
 BLACKLISTED_GUILDS = [int(sid.strip()) for sid in raw_blacklist.split(',') if sid.strip().isdigit()]
@@ -272,7 +273,7 @@ def start_local_rpc_worker():
                     break
 
                 try:
-                    client.update(activity_type=ActivityType.LISTENING, 
+                    client.update(activity_type=ActivityType.WATCHING, 
                                   name=f"{bot.user}",
                                   state=activity_text, 
                                   details=f"Running {bot.user.name} bot",
@@ -1369,11 +1370,11 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 
 
-presence_toggle = True
+presence_index = 0
 
 @tasks.loop(seconds=15)
 async def update_presence():
-    global presence_toggle
+    global presence_toggle, presence_index
 
     load_dotenv(override=True)
     raw_blacklist = os.getenv('SERVER_BLACKLIST', '')
@@ -1389,16 +1390,21 @@ async def update_presence():
 
     load_dotenv(override=True)
     VERSION = os.getenv('BOT_VERSION')
+    VERSION_ALTERNATE = os.getenv('BOT_VERSION_ALTERNATE')
     ACTIVITY_TEXT = os.getenv('ACTIVITY')
 
-    if presence_toggle:
-        online_users = sum(
-            len([m for m in guild.members if m.status != discord.Status.offline and not m.bot])
-            for guild in bot.guilds
-        )
+    # cycle between three presence messages
+    online_users = sum(
+        len([m for m in guild.members if m.status != discord.Status.offline and not m.bot])
+        for guild in bot.guilds
+    )
+
+    if presence_index == 0:
         activity_text = f"ver{VERSION} ┃ {online_users} online users"
-    else:
+    elif presence_index == 1:
         activity_text = f"ver{VERSION} ┃ {ACTIVITY_TEXT}"
+    else:
+        activity_text = f"ver{VERSION} ┃ alt{VERSION_ALTERNATE}"
 
     activity = discord.Activity(type=discord.ActivityType.watching, name=activity_text)
 
@@ -1411,7 +1417,7 @@ async def update_presence():
 
     sync_local_rpc(activity_text)
 
-    presence_toggle = not presence_toggle
+    presence_index = (presence_index + 1) % 3
 
 
 @update_presence.before_loop
@@ -1604,8 +1610,9 @@ async def voice_leave(interaction: discord.Interaction):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def ver(interaction: discord.Interaction):
     VERSION = os.getenv('BOT_VERSION')
+    VERSION_ALTERNATE = os.getenv('BOT_VERSION_ALTERNATE')
     ACTIVITY_TEXT = os.getenv('ACTIVITY')
-    await interaction.response.send_message(f"<:gear:1517576939097952496> Current version: {VERSION} | {ACTIVITY_TEXT}")
+    await interaction.response.send_message(f"<:gear:1517576939097952496> Current version: {VERSION} | Alternate: {VERSION_ALTERNATE} | {ACTIVITY_TEXT}")
 
 
 @bot.tree.command(name="roll", description="Roll a 6-sided die")
@@ -1637,21 +1644,21 @@ async def serverinfo(interaction: discord.Interaction):
     human_count = total_count - bot_count
 
     embed = discord.Embed(title=f"Information for {guild.name}", color=discord.Color.blue())
-    embed.add_field(name="👤 Server Owner", value=f"{format_user_reference(guild.owner)}", inline=True)
-    embed.add_field(name="📆 Created At", value=created_at, inline=True)
-    embed.add_field(name="📥 Joined At (user)", value=joined_at, inline=True)
+    embed.add_field(name="<:chalice:1517579767573123092> Server Owner", value=f"{format_user_reference(guild.owner)}", inline=True)
+    embed.add_field(name="<:timer:1517996239583576194> Created At", value=created_at, inline=True)
+    embed.add_field(name="<:plus:1518348756570079262> Joined At (user)", value=joined_at, inline=True)
     vanity = guild.vanity_url_code if guild.vanity_url_code else "-"
-    embed.add_field(name="🔗 Vanity Link", value=vanity, inline=True)
-    embed.add_field(name="🌍 Preferred Locale", value=f"{guild.preferred_locale}", inline=True)
-    embed.add_field(name="🛡️ Verification Level", value=str(guild.verification_level).capitalize(), inline=True)
+    embed.add_field(name="<:minus:1518348754111959150> Vanity Link", value=vanity, inline=True)
+    embed.add_field(name="<:internet:1518376144246804672> Preferred Locale", value=f"{guild.preferred_locale}", inline=True)
+    embed.add_field(name="<:shield:1518340640801427566> Verification Level", value=str(guild.verification_level).capitalize(), inline=True)
     boost_info = f"{guild.premium_subscription_count} (Level {guild.premium_tier})"
-    embed.add_field(name="💎 Server Boosts", value=boost_info, inline=True)
-    embed.add_field(name="📂 Channels", value=f"{len(guild.channels)}", inline=True)
-    embed.add_field(name="📜 Roles", value=f"{len(guild.roles)}", inline=True)
-    embed.add_field(name="\n👥 Members", value=" ", inline=False)
-    embed.add_field(name="😄 Real Accounts", value=str(human_count), inline=True)
-    embed.add_field(name="🤖 Bots", value=str(bot_count), inline=True)
-    embed.add_field(name="🌠 Total", value=str(total_count), inline=True)
+    embed.add_field(name="<:spark:1517583248421552305> Server Boosts", value=boost_info, inline=True)
+    embed.add_field(name="<:drawer:1517497564189036574> Channels", value=f"{len(guild.channels)}", inline=True)
+    embed.add_field(name="<:multi:1518348755261460661> Roles", value=f"{len(guild.roles)}", inline=True)
+    embed.add_field(name="\n<:graph:1517584522877866065> Members", value=" ", inline=False)
+    embed.add_field(name="<:approuve:1517452125687513158> Real Accounts", value=str(human_count), inline=True)
+    embed.add_field(name="<:dissaprouve:1517452151012589662> Bots", value=str(bot_count), inline=True)
+    embed.add_field(name="<:warning:1517452174991556758> Total", value=str(total_count), inline=True)
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     await interaction.response.send_message(embed=embed)
@@ -1861,9 +1868,11 @@ async def ping(interaction: discord.Interaction):
 
 @bot.tree.command(name="stats", description="Show bot statistics and status")
 @app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def stats(interaction: discord.Interaction):
     load_dotenv(override=True)
     VERSION = os.getenv('BOT_VERSION')
+    VERSION_ALTERNATE = os.getenv('BOT_VERSION_ALTERNATE')
     ACTIVITY_TEXT = os.getenv('ACTIVITY')
     total_members = sum(guild.member_count for guild in bot.guilds)
     total_guilds = len(bot.guilds)
@@ -1873,16 +1882,16 @@ async def stats(interaction: discord.Interaction):
         description="Current status and technical details of the bot."
     )
     embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else bot.user.default_avatar.url)
-    embed.add_field(name="🌐 Servers", value=str(total_guilds), inline=True)
-    embed.add_field(name="👥 Total Users", value=str(total_members), inline=True)
+    embed.add_field(name="<:internet:1518376144246804672> Servers", value=str(total_guilds), inline=True)
+    embed.add_field(name="<:graph:1517584522877866065> Total Users", value=str(total_members), inline=True)
     embed.add_field(name="<:hourglass:1517574046252924938> Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="🐍 Library", value=f"discord.py {discord.__version__}", inline=True)
-    embed.add_field(name="<:gear:1517576939097952496> Version", value=f"{VERSION} | {ACTIVITY_TEXT}", inline=True)
+    embed.add_field(name="<:python:1518376147413635154> Library", value=f"discord.py {discord.__version__}", inline=True)
+    embed.add_field(name="<:gear:1517576939097952496> Version", value=f"ver{VERSION} | alt{VERSION_ALTERNATE} | {ACTIVITY_TEXT}", inline=True)
     guild_shard_id = interaction.guild.shard_id if interaction.guild else 0
     total_shards = len(bot.shards) or 1
     shard_info = f"Shard id: {guild_shard_id} | total: {total_shards}"
-    embed.add_field(name="🔮 Shard Info", value=shard_info, inline=True)
-    embed.add_field(name="👑 Bot owner", value="-ImNinnn- (imninnn.)", inline=True)
+    embed.add_field(name="<:shard:1518376149741338744> Shard Info", value=shard_info, inline=True)
+    embed.add_field(name="<:nUtils:1518376146008539146> Bot owner", value="-ImNinnn- (imninnn.)", inline=True)
     await interaction.response.send_message(embed=embed)
 
 
@@ -1909,7 +1918,7 @@ async def slot(interaction: discord.Interaction):
 @app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
 async def coinflip(interaction: discord.Interaction):
     result = random.choice(["Heads", "Tails"])
-    await interaction.response.send_message(f"🪙 The coin landed on: **{result}**!")
+    await interaction.response.send_message(f"<:coin:1518351100783231138> The coin landed on: **{result}**!")
 
 
 @bot.tree.command(name="avatar", description="Get the profile picture of a user")
@@ -2663,40 +2672,6 @@ async def goodbye_del(interaction: discord.Interaction):
     await interaction.response.send_message("<:approve:1517452125687513158> Goodbye images have been disabled.")
 
 
-@bot.tree.command(name="test-goodbye", description="Preview the goodbye banner for a specific user")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def test_goodbye(interaction: discord.Interaction, member: discord.Member = None):
-    target_member = member or interaction.user
-    await interaction.response.defer()
-    try:
-        goodbye_file = await create_goodbye_card(target_member)
-        if goodbye_file:
-            await interaction.followup.send(f"<:image:1517497571470348539> **Goodbye Banner Preview** for {format_user_reference(target_member)}:", file=goodbye_file)
-        else:
-            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
-    except Exception as e:
-        print(f"Error in test-goodbye: {e}")
-        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
-
-
-@bot.tree.command(name="test-welcome", description="Preview the welcome banner for a specific user")
-@app_commands.allowed_installs(guilds=True, users=True)
-@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
-async def test_welcome(interaction: discord.Interaction, member: discord.Member = None):
-    target_member = member or interaction.user
-    await interaction.response.defer()
-    try:
-        welcome_file = await create_welcome_card(target_member)
-        if welcome_file:
-            await interaction.followup.send(f"<:image:1517497571470348539> **Welcome Banner Preview** for {format_user_reference(target_member)}:", file=welcome_file)
-        else:
-            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
-    except Exception as e:
-        print(f"Error in test-welcome: {e}")
-        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
-
-
 async def create_welcome_card(member):
     base_path = os.path.dirname(__file__)
     bg_path = os.path.join(base_path, "welcome_bg.png")
@@ -2975,21 +2950,21 @@ async def game_slot(interaction: discord.Interaction, amount: int):
     if before_balance < amount:
         return await interaction.response.send_message("<:disapprove:1517452151012589662> You don't have enough money to place that bet.", ephemeral=True)
 
-    emojis = ['🍒', '🍎', '🍇', '💎', '<:bell:1517497562184024275>', '🍋']
+    emojis = ['🍒', '🍎', '🍇', '💎', '🔔', '🍋']
     e1, e2, e3 = (random.choice(emojis) for _ in range(3))
 
     if e1 == e2 == e3:
         user_data["balance"] += amount*10
-        result_text = f"🎉 **JACKPOT!** You won **${amount*10}**!"
+        result_text = f"<:chalice:1517579767573123092> **JACKPOT!** You won **${amount*10}**!"
         color = discord.Color.green()
     else:
         user_data["balance"] -= amount
-        result_text = f"💸 You lost **${amount}**. Better luck next time!"
+        result_text = f"<:money:1517580310395486239> You lost **${amount}**. Better luck next time!"
         color = discord.Color.red()
 
     save_data(data)
 
-    embed = discord.Embed(title="🎰 Economy Slot Machine", description=f"Bet: **${amount}**", color=color)
+    embed = discord.Embed(title="<:777:1518352060574208031> Economy Slot Machine", description=f"Bet: **${amount}**", color=color)
     embed.add_field(name="Result", value=f"| {e1} | {e2} | {e3} |", inline=False)
     embed.add_field(name="Outcome", value=result_text, inline=False)
     embed.set_footer(text=f"Before: ${before_balance} • After: ${user_data['balance']}")
@@ -3013,16 +2988,16 @@ async def game_coinflip(interaction: discord.Interaction, amount: int):
     result = random.choice(["heads", "tails"])
     if result == "heads":
         user_data["balance"] += amount
-        result_text = f"🎉 You won **${amount}**! The coin landed on **Heads**."
+        result_text = f"<:chalice:1517579767573123092> You won **${amount}**! The coin landed on **Heads**."
         color = discord.Color.green()
     else:
         user_data["balance"] -= amount
-        result_text = f"💸 You lost **${amount}**. The coin landed on **Tails**."
+        result_text = f"<:money:1517580310395486239> You lost **${amount}**. The coin landed on **Tails**."
         color = discord.Color.red()
 
     save_data(data)
 
-    embed = discord.Embed(title="🪙 Coin Flip", description=f"Bet: **${amount}**", color=color)
+    embed = discord.Embed(title="<:coin:1518351100783231138> Coin Flip", description=f"Bet: **${amount}**", color=color)
     embed.add_field(name="Result", value=result_text, inline=False)
     embed.set_footer(text=f"Before: ${before_balance} • After: ${user_data['balance']}")
     await interaction.response.send_message(embed=embed)
@@ -3044,7 +3019,7 @@ class MinesButton(discord.ui.Button):
         view.action_taken = True
         if self.index in view.mine_positions:
             self.style = discord.ButtonStyle.danger
-            self.label = "💣"
+            self.label = "<:explosive:1517578642723573880>"
             self.disabled = True
             view.reveal_board()
             view.finished = True
@@ -3119,7 +3094,7 @@ class MinesGameView(discord.ui.View):
         self.mine_positions = set(random.sample(range(self.total_cells), self.mines))
         self.initial_revealed_index = None
         self.embed = discord.Embed(
-            title="💣 Minesweeper Gamble",
+            title="<:explosive:1517578642723573880> Minesweeper Gamble",
             description="",
             color=discord.Color.red(),
         )
@@ -3159,7 +3134,7 @@ class MinesGameView(discord.ui.View):
     def update_embed(self):
         safe_count = len(self.revealed_positions)
         payout = self.calculate_payout()
-        self.embed.title = "💣 Minesweeper Gamble"
+        self.embed.title = "<:explosive:1517578642723573880> Minesweeper Gamble"
         self.embed.description = (
             f"Bet: **${self.amount}**\n"
             f"Mines: **{self.mines}**\n"
@@ -3175,7 +3150,7 @@ class MinesGameView(discord.ui.View):
                 if item.index in self.mine_positions:
                     item.disabled = True
                     item.style = discord.ButtonStyle.danger
-                    item.label = "💣"
+                    item.label = "<:explosive:1517578642723573880>"
                 else:
                     item.disabled = True
 
@@ -3208,7 +3183,7 @@ class MinesGameView(discord.ui.View):
         active_minigame_users.discard(self.user_id)
         self.finished = True
         self.disable_all_items()
-        self.embed.title = "🏁 Minesweeper - Victory"
+        self.embed.title = "<:chalice:1517579767573123092> Minesweeper - Victory"
         self.embed.description = (
             f"You safely revealed all non-mine tiles and won **${payout}**!\n"
             f"Safe tiles found: **{len(self.revealed_positions)}/{self.total_safe}**"
@@ -3230,7 +3205,7 @@ class MinesGameView(discord.ui.View):
         self.disable_all_items()
         self.reveal_board()
         if self.message:
-            self.embed.title = "⌛ Minesweeper - Timed Out"
+            self.embed.title = "<:hourglass:1517574046252924938> Minesweeper - Timed Out"
             self.embed.description = (
                 f"Time expired and your wager of **${self.amount}** was lost.\n"
                 f"Safe tiles found: **{len(self.revealed_positions)}/{self.total_safe}**"
@@ -3305,7 +3280,7 @@ class TowerButton(discord.ui.Button):
             data = load_data()
             user_data = get_user_data(data, view.guild_id, view.user_id)
             after_balance = user_data["balance"]
-            view.embed.title = "🏯 Tower Gamble - Lost"
+            view.embed.title = "<:tower:1518350397008252958> Tower Gamble - Lost"
             view.embed.description = (
                 f"You chose the wrong button and lost your wager of **${view.amount}**.\n"
                 f"Rows cleared: {view.rows_cleared()}/5"
@@ -3357,7 +3332,7 @@ class TowersGameView(discord.ui.View):
         self.current_row = 4
         self.correct_positions = [set(random.sample(range(3), 2)) for _ in range(5)]
         self.embed = discord.Embed(
-            title="🏯 Tower Gamble",
+            title="<:tower:1518350397008252958> Tower Gamble",
             description="",
             color=discord.Color.red(),
         )
@@ -3380,7 +3355,7 @@ class TowersGameView(discord.ui.View):
         completed = self.rows_cleared()
         potential = self.calculate_payout(completed)
         next_row = 5 - self.current_row
-        self.embed.title = "🏯 Tower Gamble"
+        self.embed.title = "<:tower:1518350397008252958> Tower Gamble"
         self.embed.description = (
             f"Bet: **${self.amount}**\n"
             f"Rows cleared: **{completed}/5**\n"
@@ -3420,7 +3395,7 @@ class TowersGameView(discord.ui.View):
         active_minigame_users.discard(self.user_id)
         self.finished = True
         self.disable_all_items()
-        self.embed.title = "🏁 Tower Gamble - Victory"
+        self.embed.title = "<:chalice:1517579767573123092> Tower Gamble - Victory"
         self.embed.description = (
             f"You reached the top and won **${payout}**!\n"
             f"Rows cleared: **5/5**"
@@ -3444,7 +3419,7 @@ class TowersGameView(discord.ui.View):
             data = load_data()
             user_data = get_user_data(data, self.guild_id, self.user_id)
             after_balance = user_data["balance"]
-            self.embed.title = "⌛ Tower Gamble - Timed Out"
+            self.embed.title = "<:hourglass:1517574046252924938> Tower Gamble - Timed Out"
             self.embed.description = (
                 f"Time expired and your wager of **${self.amount}** was lost.\n"
                 f"Rows cleared: **{self.rows_cleared()}/5**"
@@ -3498,18 +3473,18 @@ class DeveloperCodeSelect(discord.ui.Select):
         if selected_index == self.correct_index:
             view.finished = True
             view.disable_all_items()
-            payout = random.randint(450, 550)
+            payout = get_work_payout(view.difficulty)
             data = load_data()
             user_data = get_user_data(data, view.guild_id, view.user_id)
             user_data["balance"] += payout
             save_data(data)
-            view.embed.title = "👨‍💻 Developer Job - Success!"
+            view.embed.title = "<:list:1517497572770451567> Developer Job - Success!"
             view.embed.description = f"You found the odd code string and earned **${payout}**!"
             await interaction.response.edit_message(embed=view.embed, view=view)
         else:
             view.finished = True
             view.disable_all_items()
-            view.embed.title = "👨‍💻 Developer Job - Failed!"
+            view.embed.title = "<:list:1517497572770451567> Developer Job - Failed!"
             view.embed.description = "That's not the odd code! You didn't earn anything this time."
             await interaction.response.edit_message(embed=view.embed, view=view)
 
@@ -3531,12 +3506,12 @@ class DeveloperCodeButton(discord.ui.Button):
         if self.is_odd:
             view.finished = True
             view.disable_all_items()
-            payout = random.randint(450, 550)
+            payout = get_work_payout(view.difficulty)
             data = load_data()
             user_data = get_user_data(data, view.guild_id, view.user_id)
             user_data["balance"] += payout
             save_data(data)
-            view.embed.title = "👨‍💻 Developer Job - Success!"
+            view.embed.title = "<:list:1517497572770451567> Developer Job - Success!"
             view.embed.description = f"You found the odd code string and earned **${payout}**!"
             await interaction.response.edit_message(embed=view.embed, view=view)
         else:
@@ -3544,7 +3519,7 @@ class DeveloperCodeButton(discord.ui.Button):
             self.style = discord.ButtonStyle.danger
             view.finished = True
             view.disable_all_items()
-            view.embed.title = "👨‍💻 Developer Job - Failed!"
+            view.embed.title = "<:list:1517497572770451567> Developer Job - Failed!"
             view.embed.description = "That's not the odd code! You didn't earn anything this time."
             await interaction.response.edit_message(embed=view.embed, view=view)
 
@@ -3577,7 +3552,7 @@ class FarmerCropButton(discord.ui.Button):
             if len(view.correct_crops_clicked) == len(view.target_crop_indices):
                 view.finished = True
                 view.disable_all_items()
-                payout = random.randint(450, 550)
+                payout = get_work_payout(view.difficulty)
                 data = load_data()
                 user_data = get_user_data(data, view.guild_id, view.user_id)
                 user_data["balance"] += payout
@@ -3598,12 +3573,18 @@ class FarmerCropButton(discord.ui.Button):
 
 
 class WorkGameView(discord.ui.View):
-    def __init__(self, job_type: str, guild_id: str, user_id: int, amount: int):
-        super().__init__(timeout=30)
+    def __init__(self, job_type: str, guild_id: str, user_id: int, amount: int, difficulty: str = "normal"):
+        difficulty_settings = WORK_DIFFICULTY_SETTINGS.get(difficulty, WORK_DIFFICULTY_SETTINGS["normal"])
+        super().__init__(timeout=difficulty_settings["timeout"])
         self.job_type = job_type
         self.guild_id = guild_id
         self.user_id = user_id
         self.amount = amount
+        self.difficulty = difficulty if difficulty in WORK_DIFFICULTY_SETTINGS else "normal"
+        self.timeout_seconds = difficulty_settings["timeout"]
+        self.developer_button_count = difficulty_settings["developer_buttons"]
+        self.farmer_target_count = difficulty_settings["farmer_targets"]
+        self.math_operations = difficulty_settings["math_operations"]
         self.finished = False
         self.correct_crops_clicked = set()
         self.target_crop_indices = set()
@@ -3619,13 +3600,16 @@ class WorkGameView(discord.ui.View):
 
     def setup_developer_job(self):
         code_string = "".join(random.choices("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", k=6))
-        code_options = [code_string] * 9
+        code_options = [code_string] * (self.developer_button_count - 1)
         odd_code = self.mutate_string(code_string)
         code_options.append(odd_code)
         random.shuffle(code_options)
         
-        self.embed.title = "👨‍💻 Developer Job"
-        self.embed.description = f"Find the code string that is different from the others!\n<:timer:1517996239583576194> **30 seconds left**"
+        self.embed.title = "<:list:1517497572770451567> Developer Job"
+        self.embed.description = (
+            f"Find the code string that is different from the others!\n"
+            f"<:timer:1517996239583576194> **{self.timeout_seconds} seconds left**"
+        )
         
         odd_index = code_options.index(odd_code)
         for i, code in enumerate(code_options):
@@ -3638,15 +3622,15 @@ class WorkGameView(discord.ui.View):
         target_crop = random.choice(crops)
         wrong_crops = random.sample([c for c in crops if c != target_crop], 2)
 
-        target_positions = set(random.sample(range(8), 2))
+        target_positions = set(random.sample(range(8), self.farmer_target_count))
         wrong_positions = set(random.sample([i for i in range(8) if i not in target_positions], 2))
         self.target_crop_indices = target_positions
 
         self.embed.title = "🌱 Farmer Job"
         self.embed.description = (
-            f"Collect all **{target_crop}** crops from the farm!\n"
+            f"Collect all **{len(target_positions)}** {target_crop} crops from the farm!\n"
             f"Click the right crops and avoid the others.\n"
-            f"<:timer:1517996239583576194> **30 seconds left**"
+            f"<:timer:1517996239583576194> **{self.timeout_seconds} seconds left**"
         )
 
         for i in range(8):
@@ -3662,22 +3646,29 @@ class WorkGameView(discord.ui.View):
             self.add_item(button)
 
     def setup_math_job(self):
-        self.embed.title = "🧮 Math Teacher Job"
-        self.embed.description = f"Solve the equation!\n<:timer:1517996239583576194> **30 seconds left**"
+        self.embed.title = "<:plus:1518348756570079262> Math Teacher Job"
+        self.embed.description = f"Solve the equation!\n<:timer:1517996239583576194> **{self.timeout_seconds} seconds left**"
         
-        num1 = random.randint(10, 99)
-        num2 = random.randint(1, 50)
-        operation = random.choice(["+", "-", "*"])
+        operation = random.choice(self.math_operations)
+        if operation == "/":
+            num2 = random.randint(2, 12)
+            self.correct_answer = random.randint(2, 12)
+            num1 = num2 * self.correct_answer
+        else:
+            num1 = random.randint(10, 99)
+            num2 = random.randint(1, 50)
         
         if operation == "+":
             self.correct_answer = num1 + num2
         elif operation == "-":
             self.correct_answer = num1 - num2
-        else:
+        elif operation == "*":
             self.correct_answer = num1 * num2
+        else:
+            self.correct_answer = num1 // num2
         
         self.equation = f"{num1} {operation} {num2} = ?"
-        self.embed.description = f"**{self.equation}**\n<:timer:1517996239583576194> **30 seconds left**"
+        self.embed.description = f"**{self.equation}**\n<:timer:1517996239583576194> **{self.timeout_seconds} seconds left**"
         
         answer_input = discord.ui.TextInput(
             label="Your Answer",
@@ -3694,7 +3685,7 @@ class WorkGameView(discord.ui.View):
             
             async def on_submit(self, modal_interaction: discord.Interaction):
                 if modal_interaction.user.id != self.view.user_id:
-                    return await modal_interaction.response.send_message("<:disapprove:1517452151012589662> This is not for you.", ephemeral=True)
+                    return await modal_interaction.response.send_message("<:multi:1518348755261460661> This is not for you.", ephemeral=True)
                 if self.view.finished:
                     return await modal_interaction.response.send_message("<:disapprove:1517452151012589662> Game already finished.", ephemeral=True)
                 
@@ -3703,19 +3694,19 @@ class WorkGameView(discord.ui.View):
                     if user_answer == self.view.correct_answer:
                         self.view.finished = True
                         self.view.disable_all_items()
-                        payout = random.randint(450, 550)
+                        payout = get_work_payout(self.view.difficulty)
                         data = load_data()
                         user_data = get_user_data(data, self.view.guild_id, self.view.user_id)
                         user_data["balance"] += payout
                         save_data(data)
-                        self.view.embed.title = "🧮 Math Teacher Job - Success!"
+                        self.view.embed.title = "<:multi:1518348755261460661> Math Teacher Job - Success!"
                         self.view.embed.description = f"Correct! The answer is **{self.view.correct_answer}**. You earned **${payout}**!"
                         await modal_interaction.response.defer()
                         await self.view.message.edit(embed=self.view.embed, view=self.view)
                     else:
                         self.view.finished = True
                         self.view.disable_all_items()
-                        self.view.embed.title = "🧮 Math Teacher Job - Failed!"
+                        self.view.embed.title = "<:minus:1518348754111959150> Math Teacher Job - Failed!"
                         self.view.embed.description = f"Wrong! The correct answer is **{self.view.correct_answer}**. You didn't earn anything this time."
                         await modal_interaction.response.defer()
                         await self.view.message.edit(embed=self.view.embed, view=self.view)
@@ -3750,7 +3741,7 @@ class WorkGameView(discord.ui.View):
         self.finished = True
         self.disable_all_items()
         if self.message:
-            self.embed.title = "⏰ Work - Timed Out"
+            self.embed.title = "<:timer:1517996239583576194> Work - Timed Out"
             self.embed.description = "Time expired! You didn't earn anything this time."
             try:
                 await self.message.edit(embed=self.embed, view=self)
@@ -3760,10 +3751,52 @@ class WorkGameView(discord.ui.View):
 
 work_cooldowns = {}
 
+WORK_DIFFICULTY_SETTINGS = {
+    "easy": {
+        "timeout": 30,
+        "developer_buttons": 8,
+        "farmer_targets": 2,
+        "math_operations": ["+", "-"],
+        "payout_range": (200, 300),
+    },
+    "normal": {
+        "timeout": 25,
+        "developer_buttons": 10,
+        "farmer_targets": 3,
+        "math_operations": ["*", "-"],
+        "payout_range": (450, 550),
+    },
+    "hard": {
+        "timeout": 20,
+        "developer_buttons": 12,
+        "farmer_targets": 4,
+        "math_operations": ["*", "/"],
+        "payout_range": (700, 800),
+    },
+}
+
+
+def get_work_payout(difficulty: str) -> int:
+    settings = WORK_DIFFICULTY_SETTINGS.get(difficulty, WORK_DIFFICULTY_SETTINGS["normal"])
+    low, high = settings["payout_range"]
+    return random.randint(low, high)
+
 
 @bot.tree.command(name="game-work", description="Work to earn money (get 1 of 3 random jobs, 2 hour cooldown)")
 @app_commands.allowed_installs(guilds=True, users=False)
-async def game_work(interaction: discord.Interaction):
+@app_commands.describe(difficulty="Choose the work difficulty")
+@app_commands.choices(
+    difficulty=[
+        app_commands.Choice(name="Easy", value="easy"),
+        app_commands.Choice(name="Normal", value="normal"),
+        app_commands.Choice(name="Hard", value="hard"),
+    ]
+)
+async def game_work(interaction: discord.Interaction, difficulty: str = "normal"):
+    difficulty = difficulty.lower().strip()
+    if difficulty not in WORK_DIFFICULTY_SETTINGS:
+        difficulty = "normal"
+
     user_id = str(interaction.user.id)
     guild_id = str(interaction.guild.id)
     cooldown_key = f"{guild_id}_{user_id}"
@@ -3790,7 +3823,7 @@ async def game_work(interaction: discord.Interaction):
     
     work_cooldowns[cooldown_key] = now
     
-    view = WorkGameView(job_type, guild_id, interaction.user.id, amount)
+    view = WorkGameView(job_type, guild_id, interaction.user.id, amount, difficulty)
     await interaction.response.send_message(embed=view.embed, view=view)
     view.message = await interaction.original_response()
 
@@ -4095,7 +4128,7 @@ async def info_recipes(interaction: discord.Interaction):
     if not recipes:
         return await interaction.response.send_message("<:disapprove:1517452151012589662> No crafting recipes found.", ephemeral=True)
 
-    embed = discord.Embed(title="⚒️ Crafting Book", color=discord.Color.blue())
+    embed = discord.Embed(title="<:craft:1518348021161660539> Crafting Book", color=discord.Color.blue())
     for result_item, recipe in recipes.items():
         ing_list = ", ".join(f"{amt}x {name}" for name, amt in recipe["reqs"].items())
         delay_str = f"<:timer:1517996239583576194> {recipe.get('delay', 0)}s" if recipe.get("delay", 0) > 0 else ""
@@ -4128,7 +4161,7 @@ async def info_uses(interaction: discord.Interaction):
         if effect.get("role_id"):
             role = interaction.guild.get_role(effect["role_id"])
             if role:
-                details.append(f"🛡️ Grants Role: **{role.name}**")
+                details.append(f"<:shield:1518340640801427566> Grants Role: **{role.name}**")
         if effect.get("temp_role_id"):
             role = interaction.guild.get_role(effect["temp_role_id"])
             dur = effect.get("duration", 0)
@@ -4139,7 +4172,7 @@ async def info_uses(interaction: discord.Interaction):
             details.append(f"<:timer:1517996239583576194> Delay: {delay}s")
         msg = effect.get("message")
         if msg and msg != "Used item!":
-            details.append(f"💬 Message: *{msg}*")
+            details.append(f"<:list:1517497572770451567> Message: *{msg}*")
         if details:
             embed.add_field(name=item, value="\n".join(details), inline=False)
 
@@ -4733,6 +4766,41 @@ async def own_stop_urgent(interaction: discord.Interaction, channel: discord.Tex
     await bot.close()
 
 
+@bot.tree.command(name="own-game-work", description="(owner) Spawn a specific work game for debugging")
+@app_commands.allowed_installs(guilds=True, users=False)
+@app_commands.describe(
+    game="Choose which work game to spawn",
+    difficulty="Choose the difficulty"
+)
+@app_commands.choices(
+    game=[
+        app_commands.Choice(name="Developer", value="developer"),
+        app_commands.Choice(name="Farmer", value="farmer"),
+        app_commands.Choice(name="Math Teacher", value="math"),
+    ],
+    difficulty=[
+        app_commands.Choice(name="Easy", value="easy"),
+        app_commands.Choice(name="Normal", value="normal"),
+        app_commands.Choice(name="Hard", value="hard"),
+    ]
+)
+async def own_game_work(interaction: discord.Interaction, game: str, difficulty: str = "normal"):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Owner only.", ephemeral=True)
+
+    difficulty = difficulty.lower().strip()
+    if difficulty not in WORK_DIFFICULTY_SETTINGS:
+        difficulty = "normal"
+
+    job_type = game.lower().strip()
+    if job_type not in {"developer", "farmer", "math"}:
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Invalid work game selected.", ephemeral=True)
+
+    view = WorkGameView(job_type, str(interaction.guild.id), interaction.user.id, 0, difficulty)
+    await interaction.response.send_message(embed=view.embed, view=view)
+    view.message = await interaction.original_response()
+
+
 @bot.tree.command(name="own-shard-info", description="(owner) Display shard status and guild distribution")
 @app_commands.allowed_installs(guilds=True, users=False)
 async def shard_info(interaction: discord.Interaction):
@@ -4790,7 +4858,7 @@ def build_bot_emoji_pages(emojis):
 
     current_length = 0
     for emoji in emojis:
-        emoji_line = f"{str(emoji)} `:{emoji.name}:` (`{emoji.id}`){' animated' if emoji.animated else ''}"
+        emoji_line = f"{str(emoji)} `<:{emoji.name}:{emoji.id}>`{' animated' if emoji.animated else ''}"
 
         addition = len(emoji_line) + 1
         if current_lines and current_length + addition > 3200:
@@ -4873,6 +4941,46 @@ async def own_bot_emojis(interaction: discord.Interaction):
     view = BotEmojiPaginator(pages)
     await interaction.response.send_message(embed=view.build_embed(), view=view)
     view.message = await interaction.original_response()
+
+
+@bot.tree.command(name="own-test-goodbye", description="Preview the goodbye banner for a specific user")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def test_goodbye(interaction: discord.Interaction, member: discord.Member = None):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Owner only.", ephemeral=True)
+
+    target_member = member or interaction.user
+    await interaction.response.defer()
+    try:
+        goodbye_file = await create_goodbye_card(target_member)
+        if goodbye_file:
+            await interaction.followup.send(f"<:image:1517497571470348539> **Goodbye Banner Preview** for {format_user_reference(target_member)}:", file=goodbye_file)
+        else:
+            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
+    except Exception as e:
+        print(f"Error in test-goodbye: {e}")
+        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
+
+
+@bot.tree.command(name="own-test-welcome", description="Preview the welcome banner for a specific user")
+@app_commands.allowed_installs(guilds=True, users=True)
+@app_commands.allowed_contexts(guilds=True, dms=True, private_channels=True)
+async def test_welcome(interaction: discord.Interaction, member: discord.Member = None):
+    if not await bot.is_owner(interaction.user):
+        return await interaction.response.send_message("<:disapprove:1517452151012589662> Owner only.", ephemeral=True)
+
+    target_member = member or interaction.user
+    await interaction.response.defer()
+    try:
+        welcome_file = await create_welcome_card(target_member)
+        if welcome_file:
+            await interaction.followup.send(f"<:image:1517497571470348539> **Welcome Banner Preview** for {format_user_reference(target_member)}:", file=welcome_file)
+        else:
+            await interaction.followup.send("<:disapprove:1517452151012589662> Failed to generate the image. Check the console for errors.")
+    except Exception as e:
+        print(f"Error in test-welcome: {e}")
+        await interaction.followup.send(f"<:warning:1517452174991556758> An error occurred: {e}")
 
 
 
