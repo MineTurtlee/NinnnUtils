@@ -1,0 +1,3 @@
+deep_translator
+pypresence
+yt_dlp
