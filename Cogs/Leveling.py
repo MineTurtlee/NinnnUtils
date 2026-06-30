@@ -3,6 +3,7 @@ from discord import Member, Embed, Color
 from discord.ext.commands import Cog, hybrid_command, Context
 from discord.app_commands import allowed_installs
 from random import randint
+from main import reaction_xp_cooldowns
 from Shared.Leveling import *
 from Shared.User import *
 
@@ -62,3 +63,30 @@ class Leveling(Cog):
         embed.add_field(name="Progress Metrics", value=progress_bar, inline=False)
         
         await ctx.send(embed=embed)
+
+    @Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        if not payload.guild_id:
+            return
+
+        guild = self.bot.get_guild(payload.guild_id)
+        if not guild:
+            return
+
+        reactor = guild.get_member(payload.user_id)
+        if reactor and not reactor.bot:
+            cooldown_key = (payload.guild_id, payload.user_id)
+            now = datetime.now()
+            last_xp = reaction_xp_cooldowns.get(cooldown_key)
+            if not last_xp or (now - last_xp).total_seconds() >= 15:
+                reaction_xp_cooldowns[cooldown_key] = now
+                await add_xp(self.bot, reactor, guild, randint(1, 3), announce_channel=guild.get_channel(payload.channel_id))
+            try:
+                channel = guild.get_channel(payload.channel_id)
+                message = await channel.fetch_message(payload.message_id)
+                if message.author and not message.author.bot and message.author.id != payload.user_id:
+                    await add_xp(self.bot, message.author, guild, randint(3, 5), announce_channel=channel)
+            except Forbidden as error:
+                add_bot_error_entry(payload.guild_id, payload.channel_id, None, "reaction xp source fetch", error)
+            except Exception:
+                pass
